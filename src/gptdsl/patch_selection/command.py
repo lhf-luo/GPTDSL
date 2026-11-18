@@ -9,6 +9,7 @@ from ..patch_context import ContextLimits
 from ..patch_context.repository import Repository
 from . import SelectionLimits, select_patches
 from .checkpoint import SelectionStore
+from .models import CONTEXT_POLICY
 from .provider import ChatCompletionsReviewer, PROMPT, ReviewConfig
 
 
@@ -34,9 +35,10 @@ def add_select_command(subcommands):
 
 def _configuration_from_config(config):
     if config is None:
-        return {"review_mode": "offline"}
+        return {"review_mode": "offline", "context_policy": CONTEXT_POLICY}
     return {"review_mode": "ai", "model": config.model, "base_url": config.base_url,
-            "timeout": config.timeout, "prompt_sha256": hashlib.sha256(PROMPT.encode("utf-8")).hexdigest()}
+            "context_policy": CONTEXT_POLICY, "timeout": config.timeout,
+            "prompt_sha256": hashlib.sha256(PROMPT.encode("utf-8")).hexdigest()}
 
 
 def _entry_label(item):
@@ -59,8 +61,10 @@ def _save_progress(store, resume):
             initialized = True
         else:
             item = result.entries[-1]
+            ai_status = ("reviewed" if "review" in item else
+                         "attempted" if item["checks"].get("ai_review_attempted") else "not_called")
             print(f"Progress: {done}/{total} ({percent:.1f}%) | {_entry_label(item)} -> {item['status']} "
-                  f"| saved | elapsed {monotonic() - started:.1f}s", flush=True)
+                  f"| saved | ai={ai_status} | elapsed {monotonic() - started:.1f}s", flush=True)
         if done < total:
             print(f"[{done + 1}/{total}] {_entry_label(result.requests[done])} | processing", flush=True)
 

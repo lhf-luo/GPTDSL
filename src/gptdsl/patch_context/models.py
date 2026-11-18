@@ -85,6 +85,7 @@ class PatchContext:
     limits: ContextLimits
     markdown: str
     schema_version: int = 1
+    include_supplements: bool = True
 
     @property
     def complete(self) -> bool:

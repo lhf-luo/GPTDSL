@@ -182,7 +182,7 @@ def test_authoritative_report_recovers_when_derived_list_write_fails(run_input, 
     assert (output / "candidates.txt").read_text(encoding="utf-8").startswith(first + "\n")
 
 
-@pytest.mark.parametrize("change", ["limits", "mode", "file", "model", "endpoint"])
+@pytest.mark.parametrize("change", ["limits", "mode", "file", "model", "endpoint", "policy"])
 def test_resume_rejects_changed_parameters_without_modifying_report(run_input, monkeypatch, change):
     args, output, path, (_root, first, second) = run_input
     ai = change in ("model", "endpoint")
@@ -197,9 +197,14 @@ def test_resume_rejects_changed_parameters_without_modifying_report(run_input, m
     monkeypatch.setattr("gptdsl.patch_selection.command.ChatCompletionsReviewer", Reviewer)
     original_args = args + (["--ai"] if ai else [])
     assert main(original_args) == 0
+    if change == "policy":
+        report = read_report(output)
+        report["run"]["configuration"].pop("context_policy")
+        (output / "selection.json").write_text(json.dumps(report), encoding="utf-8")
     original = (output / "selection.json").read_bytes()
     extra = {"limits": ["--max-files", "1"], "mode": ["--ai"], "file": [],
-             "model": ["--model", "different-model"], "endpoint": ["--base-url", "http://localhost/v1"]}[change]
+             "model": ["--model", "different-model"], "endpoint": ["--base-url", "http://localhost/v1"],
+             "policy": []}[change]
     if change == "file":
         path.write_text(f"{second}\n{first}\n", encoding="utf-8")
     assert main(original_args + ["--resume"] + extra) == 2

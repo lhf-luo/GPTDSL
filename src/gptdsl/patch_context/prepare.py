@@ -51,7 +51,7 @@ def _supplement(files, functions, fallback, sources, parent, commit, limits, dia
     return SupplementCollector(limits, diagnostics).collect(texts, closures, excluded)
 
 
-def prepare(repo, revision: str, limits: ContextLimits) -> PatchContext:
+def prepare(repo, revision: str, limits: ContextLimits, *, include_supplements: bool = True) -> PatchContext:
     repository = Repository(Path(repo))
     commit, parent, message = repository.resolve(revision)
     diff = repository.diff(parent, commit)
@@ -60,9 +60,11 @@ def prepare(repo, revision: str, limits: ContextLimits) -> PatchContext:
     files = _load_changes(repository, reader, parent, commit, changed_lines(diff))
     sources = LocalSources(reader, limits, diagnostics)
     functions, fallback = _extract(files, sources, parent, commit, diagnostics)
-    supplements = _supplement(files, functions, fallback, sources, parent, commit, limits, diagnostics)
+    supplements = (_supplement(files, functions, fallback, sources, parent, commit, limits, diagnostics)
+                   if include_supplements else ())
     diagnostics = list(dict.fromkeys(diagnostics))
     markdown = render_context(commit, parent, message, diff, files, functions, fallback,
                               supplements, diagnostics, limits)
     return PatchContext(str(repository.root), commit, parent, message, diff, files, functions,
-                        fallback, supplements, tuple(diagnostics), limits, markdown)
+                        fallback, supplements, tuple(diagnostics), limits, markdown,
+                        include_supplements=include_supplements)

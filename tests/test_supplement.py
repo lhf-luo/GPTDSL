@@ -22,6 +22,17 @@ def test_historical_headers_macros_and_one_level_callee(history):
     assert any(entry.reason == "one-level callee of WRAP" for entry in context.supplements)
 
 
+def test_local_context_mode_omits_recursive_header_collection(history):
+    commit = _case(history, {"api.h": "#define WRAP(x) helper(x)\nstatic inline int helper(int x) { return x; }\n"})
+    local = prepare_patch_context(history.path, commit, include_supplements=False)
+    full = prepare_patch_context(history.path, commit)
+    assert local.functions == full.functions and local.fallback == full.fallback
+    assert local.files == full.files and local.diff == full.diff
+    assert local.supplements == () and full.supplements
+    assert local.include_supplements is False and full.include_supplements is True
+    assert local.to_dict()["include_supplements"] is False
+
+
 def test_short_wrapper_follows_one_level_only(history):
     header = ("static inline int bottom(int x) { return x; }\n"
               "static inline int middle(int x) { return bottom(x); }\n"

@@ -8,6 +8,7 @@ from ..patch_context import ContextLimits, PatchContext
 
 Decision = Literal["suitable", "needs_review", "out_of_scope"]
 Category = Literal["error_handling", "resource_cleanup", "other", "unknown"]
+CONTEXT_POLICY = "local_best_effort_v1"
 
 
 @dataclass(frozen=True)

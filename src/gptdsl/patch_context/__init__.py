@@ -5,11 +5,12 @@ from pathlib import Path
 from .models import ContextLimits, PatchContext, PatchContextError
 
 
-def prepare_patch_context(repo: str | Path, commit: str, *, limits: ContextLimits | None = None) -> PatchContext:
+def prepare_patch_context(repo: str | Path, commit: str, *, limits: ContextLimits | None = None,
+                          include_supplements: bool = True) -> PatchContext:
     """Prepare historical C source context without changing the input repository."""
     from .prepare import prepare
 
-    return prepare(repo, commit, limits or ContextLimits())
+    return prepare(repo, commit, limits or ContextLimits(), include_supplements=include_supplements)
 
 
 __all__ = ["ContextLimits", "PatchContext", "PatchContextError", "prepare_patch_context"]

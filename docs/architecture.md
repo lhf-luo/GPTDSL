@@ -23,7 +23,7 @@ Git 历史 → 补丁筛选 → 补丁与上下文准备 → 缺陷模式提炼 
 | validation | 候选查询、回归样例及分析数据库 | 编译与执行结果、修复前后差异、反馈 |
 | evaluation | 已验证候选、独立标注样例 | 检测指标、误报漏报记录与评估条件 |
 
-补丁上下文模块已提供 `prepare_patch_context(repo, commit, *, limits=None)`，
+补丁上下文模块已提供 `prepare_patch_context(repo, commit, *, limits=None, include_supplements=True)`，
 返回带历史来源信息、前后函数与诊断的 `PatchContext`。
 筛选模块提供 `select_patches(repo, revision=None, *, commit_file=None, limits=None, reviewer=None, progress=None, previous=None)`，
 默认扫描 HEAD 历史；显式提交清单按行处理，不展开历史。两个输入互斥。
@@ -33,6 +33,9 @@ Git 历史 → 补丁筛选 → 补丁与上下文准备 → 缺陷模式提炼 
 AI 通过 `Reviewer.review(context)` 返回结构化结论，由选择器校验引用的版本、文件、行范围、
 源码内容及展示可见性。离线候选不会自动入选；标签和关键词不是入选依据。
 初期语义范围为错误处理与局部资源清理，不进行漏洞严重性或利用价值排序。
+筛选使用 `include_supplements=False` 的简化局部上下文，只提供修改函数或改动附近片段。
+诊断提示材料限制，由复核器判断是否足够；不会因为补充头文件或语法诊断直接阻止 AI。
+规模过滤与源码证据校验仍由代码执行，上下文策略变更会阻止旧断点混入。
 CLI 利用逐项进度回调保存已完成前缀，提供 Ctrl+C 保存与 `--resume` 续跑；
 筛选器保留只读、无内置文件写入的性质。断点层检查输入与复核配置，使用报告快照恢复，
 不会自行重试已经记录的错误项。

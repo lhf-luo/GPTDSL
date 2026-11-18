@@ -49,6 +49,7 @@ def test_offline_keywords_are_weak_signals_and_source_stays_unchanged(history, r
     assert result.candidate_commits == (commit,)
     candidate, excluded = result.entries
     assert candidate["status"] == "needs_review"
+    assert candidate["checks"]["ai_review_attempted"] is False
     assert candidate["signals"] == dict(fixes_tag=True, stable_tag=True, repair_word=True)
     assert "uncommitted" not in candidate["context"]["markdown"]
     assert excluded["commit"] == root and excluded["reasons"] == ["root_commit"]
@@ -93,6 +94,7 @@ def test_invalid_or_fabricated_review_never_enters_selected(history, repair, mut
     result = select_patches(history.path, limits=SelectionLimits(max_commits=1), reviewer=reviewer)
     assert result.entries[0]["status"] == "error"
     assert result.entries[0]["error"]["code"] == "ReviewError"
+    assert result.entries[0]["checks"]["ai_review_attempted"] is True
     assert not result.selected_commits
 
 
@@ -132,19 +134,21 @@ def test_size_limits_block_review(history, repair, limits, reason):
     ("int f(void) { return 2; }\n", ContextLimits(source_bytes=4), "source_size_limit"),
     ("int f(void) { return 2; }\n", ContextLimits(markdown_chars=512), "presentation_truncated"),
 ])
-def test_incomplete_source_stays_pending_without_ai(history, source, context_limits, diagnostic):
+def test_context_warnings_reach_ai_and_remain_visible(history, source, context_limits, diagnostic):
     history.write("sample.c", "int f(void) { return 1; }\n")
     history.commit("base")
     history.write("sample.c", source)
     history.commit("change")
-    reviewer = FakeReviewer()
+    reviewer = FakeReviewer(lambda _: SemanticReview("needs_review", "unknown", "Essential material is missing"))
     result = select_patches(history.path, limits=SelectionLimits(max_commits=1, context=context_limits),
                             reviewer=reviewer)
     item = result.entries[0]
     assert item["status"] == "needs_review"
-    assert item["reasons"] == ["context_requires_review"]
+    assert item["reasons"] == ["Essential material is missing"]
     assert diagnostic in {d["code"] for d in item["context"]["diagnostics"]}
-    assert not reviewer.calls
+    assert reviewer.calls == [item["commit"]]
+    assert item["checks"]["ai_review_attempted"] is True
+    assert item["review"]["decision"] == "needs_review"
 
 
 def test_rename_statistics_and_merge_filter(history, repair):

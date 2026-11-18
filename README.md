@@ -23,7 +23,7 @@ uv sync
 
 ## 从 Git 历史筛选补丁
 
-先用代码检查单父提交、C/H 文件修改和改动规模，再复用历史源码上下文。
+先用代码检查单父提交、C/H 文件修改和改动规模，再提取历史修改函数及改动附近源码片段。
 `Fixes:`、stable 标签和修复关键词仅作为参考信号，不会直接决定入选。
 初期语义复核范围为错误返回处理和局部资源清理，关注修复意图清晰、目的单一、
 上下文可读且约束可复用的补丁。入选表示适合研究语料，不代表已确认漏洞或查询可检测性。
@@ -66,7 +66,11 @@ uv run gptdsl select --repo D:/sources/linux --revision HEAD --max-commits 20 --
 密钥只从 `DEEPSEEK_API_KEY` 读取，启用 AI 时缺失密钥会在请求前报错；离线模式不需要密钥。
 服务需支持 `response_format=json_object`
 和 `max_tokens`。启用后会将符合条件的提交信息、补丁及源码展示文本发送到该服务。
-接口失败或证据无效会逐项记录并继续处理其余提交；关键上下文缺失或展示被截断时保留待复核。
+筛选采用简化的局部上下文：优先提供修改函数，提取失败时回退到实际改动行附近的限长片段，
+不递归补充头文件、宏定义或包装函数。解析错误、缺失材料、函数配对歧义及展示截断仍记录为诊断，
+但不再作为阻止 AI 的条件；由 AI 判断可见材料是否足以支持结论，材料不足时返回待复核。
+提交/文件/增删行/函数数量限制仍生效，接口失败或证据无效逐项记录，继续处理其余提交。
+`checks.ai_review_attempted` 标识是否已尝试调用复核器，成功返回并通过校验的结果保存在 `review` 中。
 
 每次导出三个文件：
 
@@ -87,11 +91,12 @@ uv run gptdsl select --repo D:/sources/linux --commit-file commits.txt --ai --ou
 uv run gptdsl select --repo D:/sources/linux --commit-file commits.txt --ai --out artifacts/selection --resume
 ```
 
-恢复时核对仓库、输入计划、筛选预算、AI 开关和模型配置。
+恢复时核对仓库、输入计划、筛选预算、上下文策略、AI 开关和模型配置。
 历史起点或文件中的引用解析结果变化（例如 HEAD 移动）、清单有效条目或参数变化时拒绝混用结果。
 密钥不保存，可更换密钥后续跑。已经记录的错误、排除和待复核项也会跳过，未完成的当前项会重新处理。
 `--overwrite` 表示从头开始，不能与 `--resume` 同用。
 旧版本缺少断点信息的报告不能直接续跑，应使用新输出目录或显式从头运行。
+旧的严格上下文策略生成的断点也不能与当前策略混用；重新筛选旧候选请使用新输出目录。
 
 `selection.json` 中的 `run.state` 为 `running`、`interrupted` 或 `completed`，
 `run.processed` 和 `run.total` 表示已记录项数与总输入项数；运行中清单只包含已处理结果。
@@ -102,9 +107,11 @@ uv run gptdsl select --repo D:/sources/linux --commit-file commits.txt --ai --ou
 ```text
 Starting: 0/100 (0.0%) completed
 [1/100] a1b2c3d4e5f6 | processing
-Progress: 1/100 (1.0%) | a1b2c3d4e5f6 -> needs_review | saved | elapsed 3.2s
+Progress: 1/100 (1.0%) | a1b2c3d4e5f6 -> needs_review | saved | ai=reviewed | elapsed 3.2s
 ```
 
+`ai=reviewed` 表示复核已返回并通过结果校验，`ai=attempted` 表示已尝试调用但未获得有效结果，
+`ai=not_called` 表示离线运行或被规模等规则排除。
 正常筛除和待复核返回 0，输入错误或任意条目发生运行错误返回 2。
 入选清单可直接传给上下文批量命令：
 
@@ -173,6 +180,8 @@ materials = context.to_dict()
 ```
 
 接口只读 Git 对象，不切换版本、不更新索引、不读取当前工作区补齐历史材料，也不下载缺失提交。
+Python 接口默认补充局部头文件及符号，可传入 `include_supplements=False` 仅收集修改文件上下文；
+筛选模块使用这种简化模式，独立 `context` 命令仍使用默认的完整收集模式。
 暂不支持根提交、合并提交或独立补丁文件。Python 接口处理单个提交，CLI 支持文件批量输入。
 
 `context.json` 保存已收集的原始源码、前后函数、来源位置和诊断；`context.md` 是有预算的展示版本。

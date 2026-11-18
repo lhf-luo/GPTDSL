@@ -8,17 +8,16 @@ from ..commit_file import read_commit_file
 from ..patch_context import PatchContextError, prepare_patch_context
 from ..patch_context.repository import Repository
 from .history import history_commits, inspect_commit
-from .models import SelectionResult
+from .models import CONTEXT_POLICY, SelectionResult
 from .review import ReviewError, validate_review
 
 
-_UNCERTAIN = {"source_size_limit", "source_unavailable", "binary_source", "parse_error",
-              "function_pair_ambiguous", "presentation_truncated"}
-
-
 def _review_candidate(repository, item, limits, reviewer):
-    context = prepare_patch_context(repository.root, item["commit"], limits=limits.context)
+    item["checks"]["ai_review_attempted"] = False
+    context = prepare_patch_context(repository.root, item["commit"], limits=limits.context,
+                                    include_supplements=False)
     item["context"] = {
+        "mode": CONTEXT_POLICY,
         "functions": [function.name for function in context.functions],
         "diagnostics": [asdict(diagnostic) for diagnostic in context.diagnostics],
         "markdown": context.markdown,
@@ -27,11 +26,9 @@ def _review_candidate(repository, item, limits, reviewer):
     if len(context.functions) > limits.max_functions:
         item.update(status="out_of_scope", reasons=["function_limit"])
         return
-    if any(diagnostic.code in _UNCERTAIN for diagnostic in context.diagnostics):
-        item["reasons"] = ["context_requires_review"]
-        return
     if reviewer is None:
         return
+    item["checks"]["ai_review_attempted"] = True
     review = reviewer.review(context)
     validate_review(review, context)
     item.update(status=review.decision, reasons=[review.reason], review=asdict(review))

@@ -29,6 +29,11 @@ The initial scope is return/error-result handling and local resource cleanup.
 Pure refactoring, formatting, feature changes, and complex concurrent protocols
 are out_of_scope. Insufficient evidence is needs_review. A clear, reusable
 repair in the initial scope may be suitable; this is not a verified bug label.
+Context contains changed functions or bounded excerpts from touched files.
+Header expansion is intentionally omitted. Parser warnings and truncation notes
+describe collection limits; do not reject a patch solely because a warning exists.
+Judge the visible repair and source. If missing material is essential to justify
+the repair or its reusable constraint, choose needs_review and explain what is missing.
 Return exactly one JSON object with:
 decision: suitable | needs_review | out_of_scope
 category: error_handling | resource_cleanup | other | unknown
