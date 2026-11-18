@@ -4,20 +4,10 @@ from collections import Counter
 import json
 from pathlib import Path
 
+from .commit_file import read_commit_file
 from .export import check_available, export_context, external_output, publish
 from .patch_context import ContextLimits, PatchContextError, prepare_patch_context
 from .patch_context.repository import Repository
-
-
-def _read_requests(path: Path) -> list[tuple[int, str]]:
-    requests = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-        reference = line.partition("#")[0].strip()
-        if reference:
-            requests.append((line_number, reference))
-    if not requests:
-        raise ValueError("Commit file contains no commit references")
-    return requests
 
 
 def _prepare_one(repository, reference, line_number, output, limits, overwrite, seen):
@@ -46,7 +36,7 @@ def _prepare_one(repository, reference, line_number, output, limits, overwrite, 
 
 def run_batch(repo: Path, commit_file: Path, output: Path,
               limits: ContextLimits, overwrite: bool) -> int:
-    requests = _read_requests(commit_file)
+    requests = read_commit_file(commit_file)
     repository = Repository(repo)
     output = external_output(repository.root, output)
     check_available(output, ("summary.json",), overwrite)

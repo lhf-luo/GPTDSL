@@ -1,4 +1,4 @@
-"""Command-line export of read-only historical patch context."""
+"""Command-line patch selection and read-only historical context export."""
 
 import argparse
 from pathlib import Path
@@ -7,6 +7,7 @@ import sys
 from .batch import run_batch
 from .export import export_context
 from .patch_context import ContextLimits, PatchContextError, prepare_patch_context
+from .patch_selection.command import add_select_command, run_select
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -20,12 +21,15 @@ def _parser() -> argparse.ArgumentParser:
     context.add_argument("--out", type=Path, required=True)
     context.add_argument("--overwrite", action="store_true")
     context.add_argument("--max-context-chars", type=int, default=32_000)
+    add_select_command(subcommands)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "select":
+            return run_select(args)
         limits = ContextLimits(markdown_chars=args.max_context_chars)
         if args.commit_file is not None:
             return run_batch(args.repo, args.commit_file, args.out, limits, args.overwrite)
@@ -35,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{exc.code}: {exc}", file=sys.stderr)
         return 2
     except (ValueError, OSError) as exc:
-        print(f"context_error: {exc}", file=sys.stderr)
+        print(f"{args.command}_error: {exc}", file=sys.stderr)
         return 2
     print(f"Wrote context.json and context.md to {args.out.resolve()} ({len(result.diagnostics)} diagnostics)")
     return 0

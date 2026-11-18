@@ -5,7 +5,7 @@
 项目借鉴 KNighter 的补丁理解思路与 MoCQ 的查询合成、反馈验证思路。
 目标输入为内核修复补丁及对应源码上下文，目标输出为 CodeQL QL 查询及评估结果。
 
-当前已实现补丁与上下文准备模块；缺陷模式提炼、QL 合成、验证、评估和 workflow 尚未实现。
+当前已实现 Git 历史补丁筛选、补丁与上下文准备模块；缺陷模式提炼、QL 合成、验证、评估和 workflow 尚未实现。
 
 ## 环境
 
@@ -20,6 +20,71 @@
 ```powershell
 uv sync
 ```
+
+## 从 Git 历史筛选补丁
+
+先用代码检查单父提交、C/H 文件修改和改动规模，再复用历史源码上下文。
+`Fixes:`、stable 标签和修复关键词仅作为参考信号，不会直接决定入选。
+初期语义复核范围为错误返回处理和局部资源清理，关注修复意图清晰、目的单一、
+上下文可读且约束可复用的补丁。入选表示适合研究语料，不代表已确认漏洞或查询可检测性。
+
+离线初筛不调用模型，所有通过初筛的提交仍待复核：
+
+```powershell
+uv run gptdsl select --repo D:/sources/linux --revision HEAD --max-commits 100 --out artifacts/selection
+```
+
+历史模式中，`--revision HEAD` 表示从当前提交沿父提交历史向前扫描，不是只处理 HEAD；
+也支持本地引用或提交范围，例如 `v6.15..v6.16`。
+`--max-commits 100` 表示最多扫描 100 个提交，包含随后被排除的提交。
+这两个参数可省略，默认仍是 HEAD 和 100。
+
+也可以直接输入一个已有提交清单，此时不需要历史范围或扫描数量：
+
+```powershell
+uv run gptdsl select --repo D:/sources/linux --commit-file commits.txt --out artifacts/selection
+```
+
+文件为 UTF-8（支持 BOM），每行一个 hash 或提交引用，支持空行、整行及行尾 `#` 注释。
+只处理列出的提交，按文件顺序执行，不展开其父提交历史；全部有效条目都会处理，不默认截断为 100 个。
+同一提交的完整 SHA、短 hash 或其他引用只处理一次，报告记录原始行号和重复项。
+无效条目记为错误并继续处理后续条目，首次失败的重复提交不会自动重试。
+`--commit-file` 与 `--revision` 互斥，文件模式不能指定 `--max-commits`。
+两个模式下，每个补丁默认最多 8 个文件、
+300 行增删、6 个改动函数，上下文展示预算为 32000 字符。命令只读本地 Git 对象，不下载提交。
+
+项目默认使用 DeepSeek 的 `deepseek-flash`，通过 Chat Completions 接口调用。
+如需 AI 语义复核，设置 `DEEPSEEK_API_KEY` 并显式添加 `--ai`：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "your-api-key"
+uv run gptdsl select --repo D:/sources/linux --revision HEAD --max-commits 20 --ai --out artifacts/reviewed
+```
+
+默认服务地址为 `https://api.deepseek.com/v1`。模型名称和服务地址可用 `--model`、`--base-url`
+或环境变量 `GPTDSL_REVIEW_MODEL`、`GPTDSL_REVIEW_BASE_URL` 覆盖，CLI 参数优先。
+密钥只从 `DEEPSEEK_API_KEY` 读取，启用 AI 时缺失密钥会在请求前报错；离线模式不需要密钥。
+服务需支持 `response_format=json_object`
+和 `max_tokens`。启用后会将符合条件的提交信息、补丁及源码展示文本发送到该服务。
+接口失败或证据无效会逐项记录并继续处理其余提交；关键上下文缺失或展示被截断时保留待复核。
+
+每次导出三个文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `commits.txt` | AI 复核为 `suitable` 且通过源码证据校验的完整 SHA；离线运行时为空 |
+| `candidates.txt` | 通过 Git 元数据与改动规模初筛的 SHA，可能包含后续被排除、待复核或失败的项 |
+| `selection.json` | 输入模式与来源、全部处理项、检查和参考信号、状态及理由、上下文与诊断、模型结果及审计哈希 |
+
+结果目录必须位于输入仓库之外。默认拒绝覆盖已有文件；显式 `--overwrite` 可替换结果。
+正常筛除和待复核返回 0，输入错误或任意条目发生运行错误返回 2。
+入选清单可直接传给上下文批量命令：
+
+```powershell
+uv run gptdsl context --repo D:/sources/linux --commit-file artifacts/reviewed/commits.txt --out artifacts/context-batch
+```
+
+Python 接口与复核器协议见 [筛选模块说明](src/gptdsl/patch_selection/README.md)。
 
 ## 准备补丁上下文
 
@@ -102,6 +167,7 @@ GPTDSL/
 ├── src/
 │   └── gptdsl/
 │       ├── cli.py
+│       ├── patch_selection/
 │       ├── patch_context/
 │       ├── pattern_analysis/
 │       ├── query_synthesis/
@@ -112,9 +178,9 @@ GPTDSL/
     └── README.md
 ```
 
-五个业务模块分别负责补丁上下文、缺陷模式、查询合成、查询验证、泛化评估。
-`workflow/` 负责流程调度，不作为第六个业务模块。
-除 `patch_context` 外，其他模块当前仍只包含职责说明文件。
+六个业务模块分别负责补丁筛选、补丁上下文、缺陷模式、查询合成、查询验证、泛化评估。
+`workflow/` 负责流程调度，不作为业务模块计数。
+除 `patch_selection`、`patch_context` 外，其他模块当前仍只包含职责说明文件。
 
 ## 测试
 
