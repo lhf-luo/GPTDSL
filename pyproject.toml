@@ -1,0 +1,25 @@
+[project]
+name = "gptdsl"
+version = "0.1.0"
+description = "Patch-guided CodeQL query synthesis and evaluation for Linux kernel source auditing."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "tree-sitter>=0.26.1",
+    "tree-sitter-c>=0.24.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"
+
+[project.scripts]
+gptdsl = "gptdsl.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
