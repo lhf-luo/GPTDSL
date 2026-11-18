@@ -7,6 +7,8 @@
 
 当前已实现 Git 历史补丁筛选、补丁与上下文准备模块；缺陷模式提炼、QL 合成、验证、评估和 workflow 尚未实现。
 
+项目目标、阶段总结及各模块设计见 [设计文档](design.md)。
+
 ## 环境
 
 - Python 3.12+
@@ -197,6 +199,7 @@ GPTDSL/
 ├── uv.lock
 ├── .python-version
 ├── README.md
+├── design.md
 ├── docs/
 │   └── architecture.md
 ├── configs/
