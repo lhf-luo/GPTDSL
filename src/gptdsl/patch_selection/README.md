@@ -39,6 +39,12 @@ result = select_patches("D:/sources/linux", commit_file="commits.txt")
 无效仓库或历史范围抛出 `PatchContextError`，无效预算抛出 `ValueError`；
 清单为空、无法读取或编码错误直接报错；逐项的 Git、上下文和复核错误记为 `error` 并继续处理。
 
+可选 `progress(result)` 回调在输入计划准备好后、以及每记录一项后调用，
+接收包含完整 `requests` 计划与当前已完成 `entries` 的 `SelectionResult`。
+`previous` 可传入先前回调收到的结果，恢复前会核对仓库、输入计划、筛选预算和已完成前缀，
+不匹配时抛出 `ValueError`。复核器配置一致性由调用方负责，CLI 额外校验模型、地址和提示词哈希。
+回调异常与 `KeyboardInterrupt` 向调用方传播，不转为某条提交的复核错误。
+
 注入 `reviewer` 可启用语义复核，其 Interface 为：
 
 ```python
@@ -59,7 +65,8 @@ result = select_patches("D:/sources/linux", "HEAD", reviewer=reviewer)
 
 ```text
 CLI → select_patches → Git 初筛 → patch_context → Reviewer（可选）→ 证据校验
-CLI → 公共导出工具 → commits.txt / candidates.txt / selection.json
+CLI → SelectionStore → 公共导出工具 → selection.json / commits.txt / candidates.txt
+SelectionStore → previous / progress 回调 → select_patches
 ```
 
 - `history.py`：有界历史、单父提交和可用父对象检查、C/H 修改和改动规模检查。
@@ -68,6 +75,7 @@ CLI → 公共导出工具 → commits.txt / candidates.txt / selection.json
 - `review.py`：结构和历史源码证据校验。
 - `provider.py`：可选 DeepSeek Chat Completions adapter，禁止跟随重定向。
 - `command.py`：CLI 参数和导出，与已有上下文批量输入衔接。
+- `checkpoint.py`：逐项快照、输出目录互斥、断点配置检查和恢复。
 
 默认预算：历史模式扫描 100 个提交，每个补丁 8 个修改文件、300 行增删、6 个改动函数；
 上下文预算继承 `ContextLimits`，默认展示 32000 字符。
@@ -81,6 +89,25 @@ CLI → 公共导出工具 → commits.txt / candidates.txt / selection.json
 `commits.txt` 只包含最终 `suitable` 项，离线时为空。
 `selection.json` 保存所有扫描项、来源与上下文展示、诊断、判断理由和证据。
 外部 adapter 另外记录模型和地址、请求/响应 SHA256、原始复核文本，不保存 API 密钥。
+
+## 中断与续跑
+
+CLI 在首次语义处理前创建空进度快照，每处理完一项就更新输出。
+CLI 默认即时输出当前处理的提交、已保存数量/总数、百分比、完成状态和本次运行耗时。
+完成进度只在该项快照保存成功后增加，重复和无效输入也计入总进度。
+恢复时先输出 `Resuming: 已完成/总数`，然后从未完成的位置继续；无需启用额外进度开关。
+`selection.json` 是断点的权威记录，包含完整已解析输入计划和已完成前缀；
+其中 `run` 记录断点版本、运行状态、已处理/总数量及不含密钥的复核配置。
+Ctrl+C 会保存当前已完成前缀并返回 130；正在处理的条目尚未记录时，下次会重新处理。
+异常结束可保留上次完整替换的快照。报告与两个清单不构成多文件事务，
+因此先保存报告，续跑时据此重新生成清单，以恢复写入中断时的显示差异。
+
+同一命令和输出目录加 `--resume` 继续。恢复时要求仓库、输入路径、引用解析结果、
+有效清单行及行号、预算、复核模式、模型/地址/超时及提示词一致，密钥不参与比较。
+已记录的错误项也不会自动重试。历史范围或 HEAD 变化时应使用新目录或从头运行，
+不能直接把另一批输入附加到原断点。
+`--overwrite` 会重置已有结果，与 `--resume` 互斥；没有断点元数据的旧报告不能恢复。
+输出目录由操作系统文件锁保护，进程退出后锁自动释放。
 
 模型默认 `deepseek-flash`，服务默认 `https://api.deepseek.com/v1`。
 启用 AI 前需要设置 `DEEPSEEK_API_KEY`，缺失或为空时立即报错；离线模式不需要配置密钥。

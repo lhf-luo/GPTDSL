@@ -1,6 +1,6 @@
 """Coordinate objective filtering and optional, grounded patch-quality review."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 from pathlib import Path
 
@@ -49,16 +49,41 @@ def _select_one(repository, commit, limits, reviewer):
     return item
 
 
-def select(repo: str | Path, revision: str, limits, reviewer) -> SelectionResult:
+def _execute(repository, result, reviewer, progress, previous):
+    if previous is not None:
+        expected = replace(result, entries=())
+        if replace(previous, entries=()) != expected:
+            raise ValueError("Checkpoint inputs or parameters changed; use the original inputs or a new output directory")
+        if len(previous.entries) > len(result.requests):
+            raise ValueError("Checkpoint has more results than input requests")
+        for item, request in zip(previous.entries, result.requests):
+            if any(item.get(key) != value for key, value in request.items()):
+                raise ValueError("Checkpoint entries do not match their input requests")
+        result = previous
+    if progress:
+        progress(result)
+    seen_entries = list(result.entries)
+    for request in result.requests[len(seen_entries):]:
+        item = dict(request)
+        if "status" not in item:
+            item.update(_select_one(repository, item["commit"], result.limits, reviewer))
+        seen_entries.append(item)
+        result = replace(result, entries=tuple(seen_entries))
+        if progress:
+            progress(result)
+    return result
+
+
+def select(repo: str | Path, revision: str, limits, reviewer, progress=None, previous=None) -> SelectionResult:
     repository = Repository(Path(repo))
     commits = history_commits(repository, revision, limits.max_commits)
-    entries = tuple(_select_one(repository, commit, limits, reviewer) for commit in commits)
-    return SelectionResult(str(repository.root), revision, limits, entries)
+    result = SelectionResult(str(repository.root), revision, limits, (),
+                             requests=tuple({"commit": commit} for commit in commits))
+    return _execute(repository, result, reviewer, progress, previous)
 
 
-def _select_request(repository, line, reference, limits, reviewer, seen):
-    item = {"line": line, "input": reference, "commit": None,
-            "status": "error", "checks": {"eligible": False}}
+def _resolve_request(repository, line, reference, seen):
+    item = {"line": line, "input": reference, "commit": None}
     try:
         if any(character.isspace() for character in reference):
             raise ValueError("Each non-comment line must contain exactly one commit reference")
@@ -69,19 +94,20 @@ def _select_request(repository, line, reference, limits, reviewer, seen):
             raise PatchContextError("commit_unavailable", str(exc)) from exc
         item["commit"] = commit
         if commit in seen:
-            item.update(status="duplicate", duplicate_of=seen[commit])
+            item.update(status="duplicate", duplicate_of=seen[commit], checks={"eligible": False})
             return item
         seen[commit] = line
-        item.update(_select_one(repository, commit, limits, reviewer))
     except (PatchContextError, OSError, ValueError) as exc:
-        item.update(error={"code": getattr(exc, "code", type(exc).__name__), "message": str(exc)})
+        item.update(status="error", checks={"eligible": False},
+                    error={"code": getattr(exc, "code", type(exc).__name__), "message": str(exc)})
     return item
 
 
-def select_from_file(repo: str | Path, commit_file: Path, limits, reviewer) -> SelectionResult:
+def select_from_file(repo: str | Path, commit_file: Path, limits, reviewer,
+                     progress=None, previous=None) -> SelectionResult:
     requests = read_commit_file(commit_file)
     repository = Repository(Path(repo))
     seen = {}
-    entries = tuple(_select_request(repository, line, reference, limits, reviewer, seen)
-                    for line, reference in requests)
-    return SelectionResult(str(repository.root), None, limits, entries, str(commit_file.resolve()))
+    resolved = tuple(_resolve_request(repository, line, reference, seen) for line, reference in requests)
+    result = SelectionResult(str(repository.root), None, limits, (), str(commit_file.resolve()), resolved)
+    return _execute(repository, result, reviewer, progress, previous)

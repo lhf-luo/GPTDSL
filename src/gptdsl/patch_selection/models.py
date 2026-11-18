@@ -56,6 +56,7 @@ class SelectionResult:
     limits: SelectionLimits
     entries: tuple[dict, ...]
     commit_file: str | None = None
+    requests: tuple[dict, ...] = ()
 
     def to_dict(self) -> dict:
         result = asdict(self)

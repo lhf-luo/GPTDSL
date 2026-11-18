@@ -74,9 +74,37 @@ uv run gptdsl select --repo D:/sources/linux --revision HEAD --max-commits 20 --
 | --- | --- |
 | `commits.txt` | AI 复核为 `suitable` 且通过源码证据校验的完整 SHA；离线运行时为空 |
 | `candidates.txt` | 通过 Git 元数据与改动规模初筛的 SHA，可能包含后续被排除、待复核或失败的项 |
-| `selection.json` | 输入模式与来源、全部处理项、检查和参考信号、状态及理由、上下文与诊断、模型结果及审计哈希 |
+| `selection.json` | 输入计划、已完成项、运行进度、检查和参考信号、状态及理由、上下文与诊断、模型结果及审计哈希 |
 
 结果目录必须位于输入仓库之外。默认拒绝覆盖已有文件；显式 `--overwrite` 可替换结果。
+每完成一条提交就更新报告和清单，无需等待整批结束。按 Ctrl+C 中断时保存已完成项并返回 130。
+用相同命令、相同输出目录加 `--resume`，即可跳过已记录项继续执行：
+
+```powershell
+# 首次运行
+uv run gptdsl select --repo D:/sources/linux --commit-file commits.txt --ai --out artifacts/selection
+# 中断后续跑
+uv run gptdsl select --repo D:/sources/linux --commit-file commits.txt --ai --out artifacts/selection --resume
+```
+
+恢复时核对仓库、输入计划、筛选预算、AI 开关和模型配置。
+历史起点或文件中的引用解析结果变化（例如 HEAD 移动）、清单有效条目或参数变化时拒绝混用结果。
+密钥不保存，可更换密钥后续跑。已经记录的错误、排除和待复核项也会跳过，未完成的当前项会重新处理。
+`--overwrite` 表示从头开始，不能与 `--resume` 同用。
+旧版本缺少断点信息的报告不能直接续跑，应使用新输出目录或显式从头运行。
+
+`selection.json` 中的 `run.state` 为 `running`、`interrupted` 或 `completed`，
+`run.processed` 和 `run.total` 表示已记录项数与总输入项数；运行中清单只包含已处理结果。
+报告逐文件原子替换，异常退出时以该报告为准，续跑时重新生成可能落后的两个清单文件。
+默认实时输出当前提交、已保存项数/总项数、百分比、单项状态和本次运行耗时，无需额外参数。
+进度包含重复和无效项，表示处理进度，不表示入选比例；续跑会先显示已有进度。例如：
+
+```text
+Starting: 0/100 (0.0%) completed
+[1/100] a1b2c3d4e5f6 | processing
+Progress: 1/100 (1.0%) | a1b2c3d4e5f6 -> needs_review | saved | elapsed 3.2s
+```
+
 正常筛除和待复核返回 0，输入错误或任意条目发生运行错误返回 2。
 入选清单可直接传给上下文批量命令：
 

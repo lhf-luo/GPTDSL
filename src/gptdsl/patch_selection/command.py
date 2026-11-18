@@ -1,13 +1,15 @@
 """CLI wiring and auditable selection artifacts."""
 
-import json
+import hashlib
 from pathlib import Path
+from time import monotonic
 
-from ..export import check_available, external_output, publish
+from ..export import external_output
 from ..patch_context import ContextLimits
 from ..patch_context.repository import Repository
 from . import SelectionLimits, select_patches
-from .provider import ChatCompletionsReviewer, ReviewConfig
+from .checkpoint import SelectionStore
+from .provider import ChatCompletionsReviewer, PROMPT, ReviewConfig
 
 
 def add_select_command(subcommands):
@@ -25,7 +27,44 @@ def add_select_command(subcommands):
     parser.add_argument("--ai", action="store_true", help="Send eligible context to the configured AI endpoint")
     parser.add_argument("--model", help="AI model override (default: deepseek-flash)")
     parser.add_argument("--base-url", help="API root override (default: https://api.deepseek.com/v1)")
-    parser.add_argument("--overwrite", action="store_true")
+    restart = parser.add_mutually_exclusive_group()
+    restart.add_argument("--overwrite", action="store_true", help="Start over, replacing existing results")
+    restart.add_argument("--resume", action="store_true", help="Continue from completed entries in selection.json")
+
+
+def _configuration_from_config(config):
+    if config is None:
+        return {"review_mode": "offline"}
+    return {"review_mode": "ai", "model": config.model, "base_url": config.base_url,
+            "timeout": config.timeout, "prompt_sha256": hashlib.sha256(PROMPT.encode("utf-8")).hexdigest()}
+
+
+def _entry_label(item):
+    commit = item.get("commit")
+    return commit[:12] if commit else ascii(item.get("input", "unknown"))[:80]
+
+
+def _save_progress(store, resume):
+    started = monotonic()
+    initialized = False
+
+    def report(result):
+        nonlocal initialized
+        store.save(result)
+        done, total = len(result.entries), len(result.requests)
+        percent = 100 * done / total if total else 100.0
+        if not initialized:
+            action = "Resuming" if resume else "Starting"
+            print(f"{action}: {done}/{total} ({percent:.1f}%) completed", flush=True)
+            initialized = True
+        else:
+            item = result.entries[-1]
+            print(f"Progress: {done}/{total} ({percent:.1f}%) | {_entry_label(item)} -> {item['status']} "
+                  f"| saved | elapsed {monotonic() - started:.1f}s", flush=True)
+        if done < total:
+            print(f"[{done + 1}/{total}] {_entry_label(result.requests[done])} | processing", flush=True)
+
+    return report
 
 
 def run_select(args) -> int:
@@ -33,23 +72,31 @@ def run_select(args) -> int:
         raise ValueError("--max-commits only applies to history input; omit it with --commit-file")
     if not args.ai and (args.model or args.base_url):
         raise ValueError("--model and --base-url require --ai")
-    reviewer = ChatCompletionsReviewer(ReviewConfig.from_env(args.model, args.base_url)) if args.ai else None
+    config = ReviewConfig.from_env(args.model, args.base_url) if args.ai else None
+    reviewer = ChatCompletionsReviewer(config) if config else None
     limits = SelectionLimits(100 if args.max_commits is None else args.max_commits, args.max_files, args.max_changed_lines,
                               args.max_functions, ContextLimits(markdown_chars=args.max_context_chars))
     repository = Repository(args.repo)
     output = external_output(repository.root, args.out)
-    check_available(output, ("commits.txt", "candidates.txt", "selection.json"), args.overwrite)
-    result = select_patches(repository.root, args.revision, commit_file=args.commit_file,
-                            limits=limits, reviewer=reviewer)
-    report = result.to_dict()
-    report["review_mode"] = "ai" if args.ai else "offline"
-    publish(output, {
-        "commits.txt": "".join(f"{sha}\n" for sha in result.selected_commits),
-        "candidates.txt": "".join(f"{sha}\n" for sha in result.candidate_commits),
-        "selection.json": json.dumps(report, ensure_ascii=True, indent=2) + "\n",
-    }, args.overwrite)
-    counts = report["counts"]
+    configuration = _configuration_from_config(config)
+    with SelectionStore(output, configuration, overwrite=args.overwrite, resume=args.resume) as store:
+        previous = store.load(limits)
+        try:
+            print("Preparing selection inputs...", flush=True)
+            result = select_patches(repository.root, args.revision, commit_file=args.commit_file,
+                                    limits=limits, reviewer=reviewer,
+                                    progress=_save_progress(store, args.resume), previous=previous)
+            store.save(result, "completed")
+        except KeyboardInterrupt:
+            if store.latest is not None:
+                store.save(store.latest, "interrupted")
+                print(f"Selection interrupted. Completed entries saved; use --resume to continue. Output: {output}",
+                      flush=True)
+            else:
+                print("Selection interrupted before checkpoint initialization; no entries completed", flush=True)
+            return 130
+    counts = result.to_dict()["counts"]
     duplicates = f", {counts['duplicate']} duplicate" if "duplicate" in counts else ""
     print(f"Selection: {counts['suitable']} suitable, {counts['needs_review']} need review, "
-          f"{counts['out_of_scope']} out of scope, {counts['error']} errors{duplicates}. Output: {output}")
+          f"{counts['out_of_scope']} out of scope, {counts['error']} errors{duplicates}. Output: {output}", flush=True)
     return 2 if counts["error"] else 0
