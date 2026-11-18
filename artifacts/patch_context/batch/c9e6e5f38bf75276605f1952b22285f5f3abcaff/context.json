@@ -1,0 +1,2363 @@
+{
+  "repository": "/home/lhf/linux",
+  "commit": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+  "parent_commit": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+  "message": "ALSA: hda: trace PCM open only after assigning a stream\n\nStream assignment can fail when hardware streams are exhausted.\nMove the tracepoint after the NULL check because its payload accesses\nthe assigned stream tag.\n\nDetected by static analysis and reviewed with AI-assisted source auditing.\n\nFixes: 184865085b88 (\"ALSA: hda - rename hda_intel_trace.h to hda_controller_trace.h\")\nAssisted-by: LLM\nSigned-off-by: Slavin Liu <bolin.liu@seu.edu.cn>\nLink: https://patch.msgid.link/20260913125154.109944-1-bolin.liu@seu.edu.cn\nSigned-off-by: Takashi Iwai <tiwai@suse.de>",
+  "diff": "diff --git a/sound/hda/common/controller.c b/sound/hda/common/controller.c\nindex afec5c5546ec..18dae022b324 100644\n--- a/sound/hda/common/controller.c\n+++ b/sound/hda/common/controller.c\n@@ -569,45 +569,45 @@ static const struct snd_pcm_hardware azx_pcm_hw = {\n \t.period_bytes_min =\t128,\n \t.period_bytes_max =\tAZX_MAX_BUF_SIZE / 2,\n \t.periods_min =\t\t2,\n \t.periods_max =\t\tAZX_MAX_FRAG,\n \t.fifo_size =\t\t0,\n };\n \n static int azx_pcm_open(struct snd_pcm_substream *substream)\n {\n \tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n \tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n \tstruct azx *chip = apcm->chip;\n \tstruct azx_dev *azx_dev;\n \tstruct snd_pcm_runtime *runtime = substream->runtime;\n \tint err;\n \tint buff_step;\n \n \tsnd_hda_codec_pcm_get(apcm->info);\n \tmutex_lock(&chip->open_mutex);\n \tazx_dev = azx_assign_device(chip, substream);\n-\ttrace_azx_pcm_open(chip, azx_dev);\n \tif (azx_dev == NULL) {\n \t\terr = -EBUSY;\n \t\tgoto unlock;\n \t}\n+\ttrace_azx_pcm_open(chip, azx_dev);\n \truntime->private_data = azx_dev;\n \n \truntime->hw = azx_pcm_hw;\n \tif (chip->gts_present)\n \t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n \truntime->hw.channels_min = hinfo->channels_min;\n \truntime->hw.channels_max = hinfo->channels_max;\n \truntime->hw.formats = hinfo->formats;\n \truntime->hw.rates = hinfo->rates;\n \tsnd_pcm_limit_hw_rates(runtime);\n \tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n \n \t/* avoid wrap-around with wall-clock */\n \tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n \t\t\t\t     20,\n \t\t\t\t     178000000);\n \n \tif (chip->align_buffer_size)\n \t\t/* constrain buffer sizes to be multiple of 128\n \t\t   bytes. This is more efficient in terms of memory\n",
+  "files": [
+    {
+      "status": "M",
+      "before_path": "sound/hda/common/controller.c",
+      "after_path": "sound/hda/common/controller.c",
+      "before_text": "// SPDX-License-Identifier: GPL-2.0-or-later\n/*\n *\n *  Implementation of primary alsa driver code base for Intel HD Audio.\n *\n *  Copyright(c) 2004 Intel Corporation\n *\n *  Copyright (c) 2004 Takashi Iwai <tiwai@suse.de>\n *                     PeiSen Hou <pshou@realtek.com.tw>\n */\n\n#include <linux/clocksource.h>\n#include <linux/delay.h>\n#include <linux/interrupt.h>\n#include <linux/kernel.h>\n#include <linux/module.h>\n#include <linux/pm_runtime.h>\n#include <linux/slab.h>\n\n#ifdef CONFIG_X86\n/* for art-tsc conversion */\n#include <asm/tsc.h>\n#endif\n\n#include <sound/core.h>\n#include <sound/initval.h>\n#include <sound/pcm_params.h>\n#include \"hda_controller.h\"\n#include \"hda_local.h\"\n\n#define CREATE_TRACE_POINTS\n#include \"controller_trace.h\"\n\n/* DSP lock helpers */\n#ifdef CONFIG_SND_HDA_DSP_LOADER\n#define guard_dsp_lock(dev)\tguard(snd_hdac_dsp_lock)(azx_stream(dev))\n#else\n#define guard_dsp_lock(dev)\tdo {} while (0)\n#endif\n#define dsp_is_locked(dev)\tsnd_hdac_stream_is_locked(azx_stream(dev))\n\n/* assign a stream for the PCM */\nstatic inline struct azx_dev *\nazx_assign_device(struct azx *chip, struct snd_pcm_substream *substream)\n{\n\tstruct hdac_stream *s;\n\n\ts = snd_hdac_stream_assign(azx_bus(chip), substream);\n\tif (!s)\n\t\treturn NULL;\n\treturn stream_to_azx_dev(s);\n}\n\n/* release the assigned stream */\nstatic inline void azx_release_device(struct azx_dev *azx_dev)\n{\n\tsnd_hdac_stream_release(azx_stream(azx_dev));\n}\n\nstatic inline struct hda_pcm_stream *\nto_hda_pcm_stream(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\treturn &apcm->info->stream[substream->stream];\n}\n\nstatic u64 azx_adjust_codec_delay(struct snd_pcm_substream *substream,\n\t\t\t\tu64 nsec)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tu64 codec_frames, codec_nsecs;\n\n\tif (!hinfo->ops.get_delay)\n\t\treturn nsec;\n\n\tcodec_frames = hinfo->ops.get_delay(hinfo, apcm->codec, substream);\n\tcodec_nsecs = div_u64(codec_frames * 1000000000LL,\n\t\t\t      substream->runtime->rate);\n\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE)\n\t\treturn nsec + codec_nsecs;\n\n\treturn (nsec > codec_nsecs) ? nsec - codec_nsecs : 0;\n}\n\n/*\n * PCM ops\n */\n\nstatic int azx_pcm_close(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\n\ttrace_azx_pcm_close(chip, azx_dev);\n\tscoped_guard(mutex, &chip->open_mutex) {\n\t\tif (chip->ops->pcm_close)\n\t\t\tchip->ops->pcm_close(chip, azx_dev);\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\tsnd_hda_power_down(apcm->codec);\n\t}\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn 0;\n}\n\nstatic int azx_pcm_hw_params(struct snd_pcm_substream *substream,\n\t\t\t     struct snd_pcm_hw_params *hw_params)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct hdac_stream *hdas = azx_stream(azx_dev);\n\n\ttrace_azx_pcm_hw_params(chip, azx_dev);\n\tguard_dsp_lock(azx_dev);\n\tif (dsp_is_locked(azx_dev))\n\t\treturn -EBUSY;\n\n\t/* Set up BDLEs here, return -ENOMEM if too many BDLEs are required */\n\thdas->bufsize = params_buffer_bytes(hw_params);\n\thdas->period_bytes = params_period_bytes(hw_params);\n\thdas->format_val = 0;\n\thdas->no_period_wakeup =\n\t\t(hw_params->info & SNDRV_PCM_INFO_NO_PERIOD_WAKEUP) &&\n\t\t(hw_params->flags & SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP);\n\tif (snd_hdac_stream_setup_periods(hdas) < 0)\n\t\treturn -ENOMEM;\n\n\treturn 0;\n}\n\nstatic int azx_pcm_hw_free(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\n\t/* reset BDL address */\n\tguard_dsp_lock(azx_dev);\n\tif (!dsp_is_locked(azx_dev))\n\t\tsnd_hdac_stream_cleanup(azx_stream(azx_dev));\n\n\tsnd_hda_codec_cleanup(apcm->codec, hinfo, substream);\n\n\tazx_stream(azx_dev)->prepared = 0;\n\treturn 0;\n}\n\nstatic int azx_pcm_prepare(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tunsigned int format_val, stream_tag, bits;\n\tint err;\n\tstruct hda_spdif_out *spdif =\n\t\tsnd_hda_spdif_out_of_nid(apcm->codec, hinfo->nid);\n\tunsigned short ctls = spdif ? spdif->ctls : 0;\n\n\ttrace_azx_pcm_prepare(chip, azx_dev);\n\tguard_dsp_lock(azx_dev);\n\tif (dsp_is_locked(azx_dev))\n\t\treturn -EBUSY;\n\n\tsnd_hdac_stream_reset(azx_stream(azx_dev));\n\tbits = snd_hdac_stream_format_bits(runtime->format, SNDRV_PCM_SUBFORMAT_STD, hinfo->maxbps);\n\n\tformat_val = snd_hdac_spdif_stream_format(runtime->channels, bits, runtime->rate, ctls);\n\tif (!format_val) {\n\t\tdev_err(chip->card->dev,\n\t\t\t\"invalid format_val, rate=%d, ch=%d, format=%d\\n\",\n\t\t\truntime->rate, runtime->channels, runtime->format);\n\t\treturn -EINVAL;\n\t}\n\n\terr = snd_hdac_stream_set_params(azx_stream(azx_dev), format_val);\n\tif (err < 0)\n\t\treturn err;\n\n\tsnd_hdac_stream_setup(azx_stream(azx_dev), false);\n\n\tstream_tag = azx_dev->core.stream_tag;\n\t/* CA-IBG chips need the playback stream starting from 1 */\n\tif ((chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND) &&\n\t    stream_tag > chip->capture_streams)\n\t\tstream_tag -= chip->capture_streams;\n\terr = snd_hda_codec_prepare(apcm->codec, hinfo, stream_tag,\n\t\t\t\t     azx_dev->core.format_val, substream);\n\tif (err < 0)\n\t\treturn err;\n\n\tazx_stream(azx_dev)->prepared = 1;\n\treturn 0;\n}\n\nstatic int azx_pcm_trigger(struct snd_pcm_substream *substream, int cmd)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_substream *s;\n\tstruct hdac_stream *hstr;\n\tbool start;\n\tint sbits = 0;\n\tint sync_reg;\n\n\tazx_dev = get_azx_dev(substream);\n\ttrace_azx_pcm_trigger(chip, azx_dev, cmd);\n\n\thstr = azx_stream(azx_dev);\n\tif (chip->driver_caps & AZX_DCAPS_OLD_SSYNC)\n\t\tsync_reg = AZX_REG_OLD_SSYNC;\n\telse\n\t\tsync_reg = AZX_REG_SSYNC;\n\n\tif (dsp_is_locked(azx_dev) || !hstr->prepared)\n\t\treturn -EPIPE;\n\n\tswitch (cmd) {\n\tcase SNDRV_PCM_TRIGGER_START:\n\tcase SNDRV_PCM_TRIGGER_PAUSE_RELEASE:\n\tcase SNDRV_PCM_TRIGGER_RESUME:\n\t\tstart = true;\n\t\tbreak;\n\tcase SNDRV_PCM_TRIGGER_PAUSE_PUSH:\n\tcase SNDRV_PCM_TRIGGER_SUSPEND:\n\tcase SNDRV_PCM_TRIGGER_STOP:\n\t\tstart = false;\n\t\tbreak;\n\tdefault:\n\t\treturn -EINVAL;\n\t}\n\n\tsnd_pcm_group_for_each_entry(s, substream) {\n\t\tif (s->pcm->card != substream->pcm->card)\n\t\t\tcontinue;\n\t\tazx_dev = get_azx_dev(s);\n\t\tsbits |= 1 << azx_dev->core.index;\n\t\tsnd_pcm_trigger_done(s, substream);\n\t}\n\n\tscoped_guard(spinlock, &bus->reg_lock) {\n\t\t/* first, set SYNC bits of corresponding streams */\n\t\tsnd_hdac_stream_sync_trigger(hstr, true, sbits, sync_reg);\n\n\t\tsnd_pcm_group_for_each_entry(s, substream) {\n\t\t\tif (s->pcm->card != substream->pcm->card)\n\t\t\t\tcontinue;\n\t\t\tazx_dev = get_azx_dev(s);\n\t\t\tif (start) {\n\t\t\t\tazx_dev->insufficient = 1;\n\t\t\t\tsnd_hdac_stream_start(azx_stream(azx_dev));\n\t\t\t} else {\n\t\t\t\tsnd_hdac_stream_stop(azx_stream(azx_dev));\n\t\t\t}\n\t\t}\n\t}\n\n\tsnd_hdac_stream_sync(hstr, start, sbits);\n\n\tguard(spinlock)(&bus->reg_lock);\n\t/* reset SYNC bits */\n\tsnd_hdac_stream_sync_trigger(hstr, false, sbits, sync_reg);\n\tsnd_hdac_stream_timecounter_init(hstr, sbits, start);\n\treturn 0;\n}\n\nunsigned int azx_get_pos_lpib(struct azx *chip, struct azx_dev *azx_dev)\n{\n\treturn snd_hdac_stream_get_pos_lpib(azx_stream(azx_dev));\n}\nEXPORT_SYMBOL_GPL(azx_get_pos_lpib);\n\nunsigned int azx_get_pos_posbuf(struct azx *chip, struct azx_dev *azx_dev)\n{\n\treturn snd_hdac_stream_get_pos_posbuf(azx_stream(azx_dev));\n}\nEXPORT_SYMBOL_GPL(azx_get_pos_posbuf);\n\nunsigned int azx_get_position(struct azx *chip,\n\t\t\t      struct azx_dev *azx_dev)\n{\n\tstruct snd_pcm_substream *substream = azx_dev->core.substream;\n\tunsigned int pos;\n\tint stream = substream->stream;\n\tint delay = 0;\n\n\tif (chip->get_position[stream])\n\t\tpos = chip->get_position[stream](chip, azx_dev);\n\telse /* use the position buffer as default */\n\t\tpos = azx_get_pos_posbuf(chip, azx_dev);\n\n\tif (pos >= azx_dev->core.bufsize)\n\t\tpos = 0;\n\n\tif (substream->runtime) {\n\t\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\t\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\n\t\tif (chip->get_delay[stream])\n\t\t\tdelay += chip->get_delay[stream](chip, azx_dev, pos);\n\t\tif (hinfo->ops.get_delay)\n\t\t\tdelay += hinfo->ops.get_delay(hinfo, apcm->codec,\n\t\t\t\t\t\t      substream);\n\t\tsubstream->runtime->delay = delay;\n\t}\n\n\ttrace_azx_get_position(chip, azx_dev, pos, delay);\n\treturn pos;\n}\nEXPORT_SYMBOL_GPL(azx_get_position);\n\nstatic snd_pcm_uframes_t azx_pcm_pointer(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\treturn bytes_to_frames(substream->runtime,\n\t\t\t       azx_get_position(chip, azx_dev));\n}\n\n/*\n * azx_scale64: Scale base by mult/div while not overflowing sanely\n *\n * Derived from scale64_check_overflow in kernel/time/timekeeping.c\n *\n * The tmestamps for a 48Khz stream can overflow after (2^64/10^9)/48K which\n * is about 384307 ie ~4.5 days.\n *\n * This scales the calculation so that overflow will happen but after 2^64 /\n * 48000 secs, which is pretty large!\n *\n * In caln below:\n *\tbase may overflow, but since there isn\u2019t any additional division\n *\tperformed on base it\u2019s OK\n *\trem can\u2019t overflow because both are 32-bit values\n */\n\n#ifdef CONFIG_X86\nstatic u64 azx_scale64(u64 base, u32 num, u32 den)\n{\n\tu64 rem;\n\n\trem = do_div(base, den);\n\n\tbase *= num;\n\trem *= num;\n\n\tdo_div(rem, den);\n\n\treturn base + rem;\n}\n\nstatic int azx_get_sync_time(ktime_t *device,\n\t\tstruct system_counterval_t *system, void *ctx)\n{\n\tstruct snd_pcm_substream *substream = ctx;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct snd_pcm_runtime *runtime;\n\tu64 ll_counter, ll_counter_l, ll_counter_h;\n\tu64 tsc_counter, tsc_counter_l, tsc_counter_h;\n\tu32 wallclk_ctr, wallclk_cycles;\n\tbool direction;\n\tu32 dma_select;\n\tu32 timeout;\n\tu32 retry_count = 0;\n\n\truntime = substream->runtime;\n\n\tif (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)\n\t\tdirection = 1;\n\telse\n\t\tdirection = 0;\n\n\t/* 0th stream tag is not used, so DMA ch 0 is for 1st stream tag */\n\tdo {\n\t\ttimeout = 100;\n\t\tdma_select = (direction << GTSCC_CDMAS_DMA_DIR_SHIFT) |\n\t\t\t\t\t(azx_dev->core.stream_tag - 1);\n\t\tsnd_hdac_chip_writel(azx_bus(chip), GTSCC, dma_select);\n\n\t\t/* Enable the capture */\n\t\tsnd_hdac_chip_updatel(azx_bus(chip), GTSCC, 0, GTSCC_TSCCI_MASK);\n\n\t\twhile (timeout) {\n\t\t\tif (snd_hdac_chip_readl(azx_bus(chip), GTSCC) &\n\t\t\t\t\t\tGTSCC_TSCCD_MASK)\n\t\t\t\tbreak;\n\n\t\t\ttimeout--;\n\t\t}\n\n\t\tif (!timeout) {\n\t\t\tdev_err(chip->card->dev, \"GTSCC capture Timedout!\\n\");\n\t\t\treturn -EIO;\n\t\t}\n\n\t\t/* Read wall clock counter */\n\t\twallclk_ctr = snd_hdac_chip_readl(azx_bus(chip), WALFCC);\n\n\t\t/* Read TSC counter */\n\t\ttsc_counter_l = snd_hdac_chip_readl(azx_bus(chip), TSCCL);\n\t\ttsc_counter_h = snd_hdac_chip_readl(azx_bus(chip), TSCCU);\n\n\t\t/* Read Link counter */\n\t\tll_counter_l = snd_hdac_chip_readl(azx_bus(chip), LLPCL);\n\t\tll_counter_h = snd_hdac_chip_readl(azx_bus(chip), LLPCU);\n\n\t\t/* Ack: registers read done */\n\t\tsnd_hdac_chip_writel(azx_bus(chip), GTSCC, GTSCC_TSCCD_SHIFT);\n\n\t\ttsc_counter = (tsc_counter_h << TSCCU_CCU_SHIFT) |\n\t\t\t\t\t\ttsc_counter_l;\n\n\t\tll_counter = (ll_counter_h << LLPC_CCU_SHIFT) |\tll_counter_l;\n\t\twallclk_cycles = wallclk_ctr & WALFCC_CIF_MASK;\n\n\t\t/*\n\t\t * An error occurs near frame \"rollover\". The clocks in\n\t\t * frame value indicates whether this error may have\n\t\t * occurred. Here we use the value of 10 i.e.,\n\t\t * HDA_MAX_CYCLE_OFFSET\n\t\t */\n\t\tif (wallclk_cycles < HDA_MAX_CYCLE_VALUE - HDA_MAX_CYCLE_OFFSET\n\t\t\t\t\t&& wallclk_cycles > HDA_MAX_CYCLE_OFFSET)\n\t\t\tbreak;\n\n\t\t/*\n\t\t * Sleep before we read again, else we may again get\n\t\t * value near to MAX_CYCLE. Try to sleep for different\n\t\t * amount of time so we dont hit the same number again\n\t\t */\n\t\tudelay(retry_count++);\n\n\t} while (retry_count != HDA_MAX_CYCLE_READ_RETRY);\n\n\tif (retry_count == HDA_MAX_CYCLE_READ_RETRY) {\n\t\tdev_err_ratelimited(chip->card->dev,\n\t\t\t\"Error in WALFCC cycle count\\n\");\n\t\treturn -EIO;\n\t}\n\n\t*device = ns_to_ktime(azx_scale64(ll_counter,\n\t\t\t\tNSEC_PER_SEC, runtime->rate));\n\t*device = ktime_add_ns(*device, (wallclk_cycles * NSEC_PER_SEC) /\n\t\t\t       ((HDA_MAX_CYCLE_VALUE + 1) * runtime->rate));\n\n\tsystem->cycles = tsc_counter;\n\tsystem->cs_id = CSID_X86_ART;\n\n\treturn 0;\n}\n\n#else\nstatic int azx_get_sync_time(ktime_t *device,\n\t\tstruct system_counterval_t *system, void *ctx)\n{\n\treturn -ENXIO;\n}\n#endif\n\nstatic int azx_get_crosststamp(struct snd_pcm_substream *substream,\n\t\t\t      struct system_device_crosststamp *xtstamp)\n{\n\treturn get_device_system_crosststamp(azx_get_sync_time,\n\t\t\t\t\tsubstream, NULL, xtstamp);\n}\n\nstatic inline bool is_link_time_supported(struct snd_pcm_runtime *runtime,\n\t\t\t\tstruct snd_pcm_audio_tstamp_config *ts)\n{\n\tif (runtime->hw.info & SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME)\n\t\tif (ts->type_requested == SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED)\n\t\t\treturn true;\n\n\treturn false;\n}\n\nstatic int azx_get_time_info(struct snd_pcm_substream *substream,\n\t\t\tstruct timespec64 *system_ts, struct timespec64 *audio_ts,\n\t\t\tstruct snd_pcm_audio_tstamp_config *audio_tstamp_config,\n\t\t\tstruct snd_pcm_audio_tstamp_report *audio_tstamp_report)\n{\n\tstruct system_device_crosststamp xtstamp = { .clock_id = CLOCK_REALTIME };\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint ret;\n\tu64 nsec;\n\n\tif ((substream->runtime->hw.info & SNDRV_PCM_INFO_HAS_LINK_ATIME) &&\n\t\t(audio_tstamp_config->type_requested == SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK)) {\n\n\t\tsnd_pcm_gettime(substream->runtime, system_ts);\n\n\t\tnsec = timecounter_read(&azx_dev->core.tc);\n\t\tif (audio_tstamp_config->report_delay)\n\t\t\tnsec = azx_adjust_codec_delay(substream, nsec);\n\n\t\t*audio_ts = ns_to_timespec64(nsec);\n\n\t\taudio_tstamp_report->actual_type = SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK;\n\t\taudio_tstamp_report->accuracy_report = 1; /* rest of structure is valid */\n\t\taudio_tstamp_report->accuracy = 42; /* 24 MHz WallClock == 42ns resolution */\n\n\t} else if (is_link_time_supported(runtime, audio_tstamp_config)) {\n\n\t\tret = azx_get_crosststamp(substream, &xtstamp);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tswitch (runtime->tstamp_type) {\n\t\tcase SNDRV_PCM_TSTAMP_TYPE_MONOTONIC:\n\t\t\treturn -EINVAL;\n\n\t\tcase SNDRV_PCM_TSTAMP_TYPE_MONOTONIC_RAW:\n\t\t\t*system_ts = ktime_to_timespec64(xtstamp.sys_monoraw);\n\t\t\tbreak;\n\n\t\tdefault:\n\t\t\t*system_ts = ktime_to_timespec64(xtstamp.sys_systime);\n\t\t\tbreak;\n\n\t\t}\n\n\t\t*audio_ts = ktime_to_timespec64(xtstamp.device);\n\n\t\taudio_tstamp_report->actual_type =\n\t\t\tSNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED;\n\t\taudio_tstamp_report->accuracy_report = 1;\n\t\t/* 24 MHz WallClock == 42ns resolution */\n\t\taudio_tstamp_report->accuracy = 42;\n\n\t} else {\n\t\taudio_tstamp_report->actual_type = SNDRV_PCM_AUDIO_TSTAMP_TYPE_DEFAULT;\n\t}\n\n\treturn 0;\n}\n\nstatic const struct snd_pcm_hardware azx_pcm_hw = {\n\t.info =\t\t\t(SNDRV_PCM_INFO_MMAP |\n\t\t\t\t SNDRV_PCM_INFO_INTERLEAVED |\n\t\t\t\t SNDRV_PCM_INFO_BLOCK_TRANSFER |\n\t\t\t\t SNDRV_PCM_INFO_MMAP_VALID |\n\t\t\t\t /* No full-resume yet implemented */\n\t\t\t\t /* SNDRV_PCM_INFO_RESUME |*/\n\t\t\t\t SNDRV_PCM_INFO_PAUSE |\n\t\t\t\t SNDRV_PCM_INFO_SYNC_START |\n\t\t\t\t SNDRV_PCM_INFO_HAS_WALL_CLOCK | /* legacy */\n\t\t\t\t SNDRV_PCM_INFO_HAS_LINK_ATIME |\n\t\t\t\t SNDRV_PCM_INFO_NO_PERIOD_WAKEUP),\n\t.formats =\t\tSNDRV_PCM_FMTBIT_S16_LE,\n\t.rates =\t\tSNDRV_PCM_RATE_48000,\n\t.rate_min =\t\t48000,\n\t.rate_max =\t\t48000,\n\t.channels_min =\t\t2,\n\t.channels_max =\t\t2,\n\t.buffer_bytes_max =\tAZX_MAX_BUF_SIZE,\n\t.period_bytes_min =\t128,\n\t.period_bytes_max =\tAZX_MAX_BUF_SIZE / 2,\n\t.periods_min =\t\t2,\n\t.periods_max =\t\tAZX_MAX_FRAG,\n\t.fifo_size =\t\t0,\n};\n\nstatic int azx_pcm_open(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint err;\n\tint buff_step;\n\n\tsnd_hda_codec_pcm_get(apcm->info);\n\tmutex_lock(&chip->open_mutex);\n\tazx_dev = azx_assign_device(chip, substream);\n\ttrace_azx_pcm_open(chip, azx_dev);\n\tif (azx_dev == NULL) {\n\t\terr = -EBUSY;\n\t\tgoto unlock;\n\t}\n\truntime->private_data = azx_dev;\n\n\truntime->hw = azx_pcm_hw;\n\tif (chip->gts_present)\n\t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n\truntime->hw.channels_min = hinfo->channels_min;\n\truntime->hw.channels_max = hinfo->channels_max;\n\truntime->hw.formats = hinfo->formats;\n\truntime->hw.rates = hinfo->rates;\n\tsnd_pcm_limit_hw_rates(runtime);\n\tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n\n\t/* avoid wrap-around with wall-clock */\n\tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n\t\t\t\t     20,\n\t\t\t\t     178000000);\n\n\tif (chip->align_buffer_size)\n\t\t/* constrain buffer sizes to be multiple of 128\n\t\t   bytes. This is more efficient in terms of memory\n\t\t   access but isn't required by the HDA spec and\n\t\t   prevents users from specifying exact period/buffer\n\t\t   sizes. For example for 44.1kHz, a period size set\n\t\t   to 20ms will be rounded to 19.59ms. */\n\t\tbuff_step = 128;\n\telse\n\t\t/* Don't enforce steps on buffer sizes, still need to\n\t\t   be multiple of 4 bytes (HDA spec). Tested on Intel\n\t\t   HDA controllers, may not work on all devices where\n\t\t   option needs to be disabled */\n\t\tbuff_step = 4;\n\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_hda_power_up(apcm->codec);\n\tif (hinfo->ops.open)\n\t\terr = hinfo->ops.open(hinfo, apcm->codec, substream);\n\telse\n\t\terr = -ENODEV;\n\tif (err < 0) {\n\t\tazx_release_device(azx_dev);\n\t\tgoto powerdown;\n\t}\n\tsnd_pcm_limit_hw_rates(runtime);\n\t/* sanity check */\n\tif (snd_BUG_ON(!runtime->hw.channels_min) ||\n\t    snd_BUG_ON(!runtime->hw.channels_max) ||\n\t    snd_BUG_ON(!runtime->hw.formats) ||\n\t    snd_BUG_ON(!runtime->hw.rates)) {\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\terr = -EINVAL;\n\t\tgoto powerdown;\n\t}\n\n\t/* disable LINK_ATIME timestamps for capture streams\n\t   until we figure out how to handle digital inputs */\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_WALL_CLOCK; /* legacy */\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_LINK_ATIME;\n\t}\n\n\tsnd_pcm_set_sync(substream);\n\tmutex_unlock(&chip->open_mutex);\n\treturn 0;\n\n powerdown:\n\tsnd_hda_power_down(apcm->codec);\n unlock:\n\tmutex_unlock(&chip->open_mutex);\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn err;\n}\n\nstatic const struct snd_pcm_ops azx_pcm_ops = {\n\t.open = azx_pcm_open,\n\t.close = azx_pcm_close,\n\t.hw_params = azx_pcm_hw_params,\n\t.hw_free = azx_pcm_hw_free,\n\t.prepare = azx_pcm_prepare,\n\t.trigger = azx_pcm_trigger,\n\t.pointer = azx_pcm_pointer,\n\t.get_time_info =  azx_get_time_info,\n};\n\nstatic void azx_pcm_free(struct snd_pcm *pcm)\n{\n\tstruct azx_pcm *apcm = pcm->private_data;\n\tif (apcm) {\n\t\tlist_del(&apcm->list);\n\t\tapcm->info->pcm = NULL;\n\t\tkfree(apcm);\n\t}\n}\n\n#define MAX_PREALLOC_SIZE\t(32 * 1024 * 1024)\n\nint snd_hda_attach_pcm_stream(struct hda_bus *_bus, struct hda_codec *codec,\n\t\t\t      struct hda_pcm *cpcm)\n{\n\tstruct hdac_bus *bus = &_bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct snd_pcm *pcm;\n\tstruct azx_pcm *apcm;\n\tint pcm_dev = cpcm->device;\n\tunsigned int size;\n\tint s, err;\n\tint type = SNDRV_DMA_TYPE_DEV_SG;\n\n\tlist_for_each_entry(apcm, &chip->pcm_list, list) {\n\t\tif (apcm->pcm->device == pcm_dev) {\n\t\t\tdev_err(chip->card->dev, \"PCM %d already exists\\n\",\n\t\t\t\tpcm_dev);\n\t\t\treturn -EBUSY;\n\t\t}\n\t}\n\terr = snd_pcm_new(chip->card, cpcm->name, pcm_dev,\n\t\t\t  cpcm->stream[SNDRV_PCM_STREAM_PLAYBACK].substreams,\n\t\t\t  cpcm->stream[SNDRV_PCM_STREAM_CAPTURE].substreams,\n\t\t\t  &pcm);\n\tif (err < 0)\n\t\treturn err;\n\tstrscpy(pcm->name, cpcm->name, sizeof(pcm->name));\n\tapcm = kzalloc_obj(*apcm);\n\tif (apcm == NULL) {\n\t\tsnd_device_free(chip->card, pcm);\n\t\treturn -ENOMEM;\n\t}\n\tapcm->chip = chip;\n\tapcm->pcm = pcm;\n\tapcm->codec = codec;\n\tapcm->info = cpcm;\n\tpcm->private_data = apcm;\n\tpcm->private_free = azx_pcm_free;\n\tif (cpcm->pcm_type == HDA_PCM_TYPE_MODEM)\n\t\tpcm->dev_class = SNDRV_PCM_CLASS_MODEM;\n\tlist_add_tail(&apcm->list, &chip->pcm_list);\n\tcpcm->pcm = pcm;\n\tfor (s = 0; s < 2; s++) {\n\t\tif (cpcm->stream[s].substreams)\n\t\t\tsnd_pcm_set_ops(pcm, s, &azx_pcm_ops);\n\t}\n\t/* buffer pre-allocation */\n\tsize = CONFIG_SND_HDA_PREALLOC_SIZE * 1024;\n\tif (size > MAX_PREALLOC_SIZE)\n\t\tsize = MAX_PREALLOC_SIZE;\n\tif (chip->uc_buffer)\n\t\ttype = SNDRV_DMA_TYPE_DEV_WC_SG;\n\tsnd_pcm_set_managed_buffer_all(pcm, type, chip->card->dev,\n\t\t\t\t       size, MAX_PREALLOC_SIZE);\n\treturn 0;\n}\n\nstatic unsigned int azx_command_addr(u32 cmd)\n{\n\tunsigned int addr = cmd >> 28;\n\n\tif (addr >= AZX_MAX_CODECS) {\n\t\tsnd_BUG();\n\t\taddr = 0;\n\t}\n\n\treturn addr;\n}\n\n/* receive a response */\nstatic int azx_rirb_get_response(struct hdac_bus *bus, unsigned int addr,\n\t\t\t\t unsigned int *res)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct hda_bus *hbus = &chip->bus;\n\tint err;\n\n again:\n\terr = snd_hdac_bus_get_response(bus, addr, res);\n\tif (!err)\n\t\treturn 0;\n\n\tif (hbus->no_response_fallback)\n\t\treturn -EIO;\n\n\tif (!bus->polling_mode) {\n\t\tdev_warn(chip->card->dev,\n\t\t\t \"azx_get_response timeout, switching to polling mode: last cmd=0x%08x\\n\",\n\t\t\t bus->last_cmd[addr]);\n\t\tbus->polling_mode = 1;\n\t\tgoto again;\n\t}\n\n\tif (chip->msi) {\n\t\tdev_warn(chip->card->dev,\n\t\t\t \"No response from codec, disabling MSI: last cmd=0x%08x\\n\",\n\t\t\t bus->last_cmd[addr]);\n\t\tif (chip->ops->disable_msi_reset_irq &&\n\t\t    chip->ops->disable_msi_reset_irq(chip) < 0)\n\t\t\treturn -EIO;\n\t\tgoto again;\n\t}\n\n\tif (chip->probing) {\n\t\t/* If this critical timeout happens during the codec probing\n\t\t * phase, this is likely an access to a non-existing codec\n\t\t * slot.  Better to return an error and reset the system.\n\t\t */\n\t\treturn -EIO;\n\t}\n\n\t/* no fallback mechanism? */\n\tif (!chip->fallback_to_single_cmd)\n\t\treturn -EIO;\n\n\t/* a fatal communication error; need either to reset or to fallback\n\t * to the single_cmd mode\n\t */\n\tif (hbus->allow_bus_reset && !hbus->response_reset && !hbus->in_reset) {\n\t\thbus->response_reset = 1;\n\t\tdev_err(chip->card->dev,\n\t\t\t\"No response from codec, resetting bus: last cmd=0x%08x\\n\",\n\t\t\tbus->last_cmd[addr]);\n\t\treturn -EAGAIN; /* give a chance to retry */\n\t}\n\n\tdev_err(chip->card->dev,\n\t\t\"azx_get_response timeout, switching to single_cmd mode: last cmd=0x%08x\\n\",\n\t\tbus->last_cmd[addr]);\n\tchip->single_cmd = 1;\n\thbus->response_reset = 0;\n\tsnd_hdac_bus_stop_cmd_io(bus);\n\treturn -EIO;\n}\n\n/*\n * Use the single immediate command instead of CORB/RIRB for simplicity\n *\n * Note: according to Intel, this is not preferred use.  The command was\n *       intended for the BIOS only, and may get confused with unsolicited\n *       responses.  So, we shouldn't use it for normal operation from the\n *       driver.\n *       I left the codes, however, for debugging/testing purposes.\n */\n\n/* receive a response */\nstatic int azx_single_wait_for_response(struct azx *chip, unsigned int addr)\n{\n\tint timeout = 50;\n\n\twhile (timeout--) {\n\t\t/* check IRV busy bit */\n\t\tif (azx_readw(chip, IRS) & AZX_IRS_VALID) {\n\t\t\t/* reuse rirb.res as the response return value */\n\t\t\tazx_bus(chip)->rirb.res[addr] = azx_readl(chip, IR);\n\t\t\treturn 0;\n\t\t}\n\t\tudelay(1);\n\t}\n\tif (printk_ratelimit())\n\t\tdev_dbg(chip->card->dev, \"get_response timeout: IRS=0x%x\\n\",\n\t\t\tazx_readw(chip, IRS));\n\tazx_bus(chip)->rirb.res[addr] = -1;\n\treturn -EIO;\n}\n\n/* send a command */\nstatic int azx_single_send_cmd(struct hdac_bus *bus, u32 val)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\tunsigned int addr = azx_command_addr(val);\n\tint timeout = 50;\n\n\tbus->last_cmd[azx_command_addr(val)] = val;\n\twhile (timeout--) {\n\t\t/* check ICB busy bit */\n\t\tif (!((azx_readw(chip, IRS) & AZX_IRS_BUSY))) {\n\t\t\t/* Clear IRV valid bit */\n\t\t\tazx_writew(chip, IRS, azx_readw(chip, IRS) |\n\t\t\t\t   AZX_IRS_VALID);\n\t\t\tazx_writel(chip, IC, val);\n\t\t\tazx_writew(chip, IRS, azx_readw(chip, IRS) |\n\t\t\t\t   AZX_IRS_BUSY);\n\t\t\treturn azx_single_wait_for_response(chip, addr);\n\t\t}\n\t\tudelay(1);\n\t}\n\tif (printk_ratelimit())\n\t\tdev_dbg(chip->card->dev,\n\t\t\t\"send_cmd timeout: IRS=0x%x, val=0x%x\\n\",\n\t\t\tazx_readw(chip, IRS), val);\n\treturn -EIO;\n}\n\n/* receive a response */\nstatic int azx_single_get_response(struct hdac_bus *bus, unsigned int addr,\n\t\t\t\t   unsigned int *res)\n{\n\tif (res)\n\t\t*res = bus->rirb.res[addr];\n\treturn 0;\n}\n\n/*\n * The below are the main callbacks from hda_codec.\n *\n * They are just the skeleton to call sub-callbacks according to the\n * current setting of chip->single_cmd.\n */\n\n/* send a command */\nstatic int azx_send_cmd(struct hdac_bus *bus, unsigned int val)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\n\tif (chip->disabled)\n\t\treturn 0;\n\tif (chip->single_cmd || bus->use_pio_for_commands)\n\t\treturn azx_single_send_cmd(bus, val);\n\telse\n\t\treturn snd_hdac_bus_send_cmd(bus, val);\n}\n\n/* get a response */\nstatic int azx_get_response(struct hdac_bus *bus, unsigned int addr,\n\t\t\t    unsigned int *res)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\n\tif (chip->disabled)\n\t\treturn 0;\n\tif (chip->single_cmd || bus->use_pio_for_commands)\n\t\treturn azx_single_get_response(bus, addr, res);\n\telse\n\t\treturn azx_rirb_get_response(bus, addr, res);\n}\n\nstatic const struct hdac_bus_ops bus_core_ops = {\n\t.command = azx_send_cmd,\n\t.get_response = azx_get_response,\n};\n\n#ifdef CONFIG_SND_HDA_DSP_LOADER\n/*\n * DSP loading code (e.g. for CA0132)\n */\n\n/* use the first stream for loading DSP */\nstatic struct azx_dev *\nazx_get_dsp_loader_dev(struct azx *chip)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tstruct hdac_stream *s;\n\n\tlist_for_each_entry(s, &bus->stream_list, list)\n\t\tif (s->index == chip->playback_index_offset)\n\t\t\treturn stream_to_azx_dev(s);\n\n\treturn NULL;\n}\n\nint snd_hda_codec_load_dsp_prepare(struct hda_codec *codec, unsigned int format,\n\t\t\t\t   unsigned int byte_size,\n\t\t\t\t   struct snd_dma_buffer *bufp)\n{\n\tstruct hdac_bus *bus = &codec->bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev;\n\tstruct hdac_stream *hstr;\n\tbool saved = false;\n\tint err;\n\n\tazx_dev = azx_get_dsp_loader_dev(chip);\n\thstr = azx_stream(azx_dev);\n\tscoped_guard(spinlock_irq, &bus->reg_lock) {\n\t\tif (hstr->opened) {\n\t\t\tchip->saved_azx_dev = *azx_dev;\n\t\t\tsaved = true;\n\t\t}\n\t}\n\n\terr = snd_hdac_dsp_prepare(hstr, format, byte_size, bufp);\n\tif (err < 0) {\n\t\tguard(spinlock_irq)(&bus->reg_lock);\n\t\tif (saved)\n\t\t\t*azx_dev = chip->saved_azx_dev;\n\t\treturn err;\n\t}\n\n\thstr->prepared = 0;\n\treturn err;\n}\nEXPORT_SYMBOL_GPL(snd_hda_codec_load_dsp_prepare);\n\nvoid snd_hda_codec_load_dsp_trigger(struct hda_codec *codec, bool start)\n{\n\tstruct hdac_bus *bus = &codec->bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev = azx_get_dsp_loader_dev(chip);\n\n\tsnd_hdac_dsp_trigger(azx_stream(azx_dev), start);\n}\nEXPORT_SYMBOL_GPL(snd_hda_codec_load_dsp_trigger);\n\nvoid snd_hda_codec_load_dsp_cleanup(struct hda_codec *codec,\n\t\t\t\t    struct snd_dma_buffer *dmab)\n{\n\tstruct hdac_bus *bus = &codec->bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev = azx_get_dsp_loader_dev(chip);\n\tstruct hdac_stream *hstr = azx_stream(azx_dev);\n\n\tif (!dmab->area || !hstr->locked)\n\t\treturn;\n\n\tsnd_hdac_dsp_cleanup(hstr, dmab);\n\tguard(spinlock_irq)(&bus->reg_lock);\n\tif (hstr->opened)\n\t\t*azx_dev = chip->saved_azx_dev;\n\thstr->locked = false;\n}\nEXPORT_SYMBOL_GPL(snd_hda_codec_load_dsp_cleanup);\n#endif /* CONFIG_SND_HDA_DSP_LOADER */\n\n/*\n * reset and start the controller registers\n */\nvoid azx_init_chip(struct azx *chip, bool full_reset)\n{\n\tif (snd_hdac_bus_init_chip(azx_bus(chip), full_reset)) {\n\t\t/* correct RINTCNT for CXT */\n\t\tif (chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND)\n\t\t\tazx_writew(chip, RINTCNT, 0xc0);\n\t}\n}\nEXPORT_SYMBOL_GPL(azx_init_chip);\n\nvoid azx_stop_all_streams(struct azx *chip)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\n\tsnd_hdac_stop_streams(bus);\n}\nEXPORT_SYMBOL_GPL(azx_stop_all_streams);\n\nvoid azx_stop_chip(struct azx *chip)\n{\n\tsnd_hdac_bus_stop_chip(azx_bus(chip));\n}\nEXPORT_SYMBOL_GPL(azx_stop_chip);\n\n/*\n * interrupt handler\n */\nstatic void stream_update(struct hdac_bus *bus, struct hdac_stream *s)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev = stream_to_azx_dev(s);\n\n\t/* check whether this IRQ is really acceptable */\n\tif (!chip->ops->position_check ||\n\t    chip->ops->position_check(chip, azx_dev)) {\n\t\tspin_unlock(&bus->reg_lock);\n\t\tsnd_pcm_period_elapsed(azx_stream(azx_dev)->substream);\n\t\tspin_lock(&bus->reg_lock);\n\t}\n}\n\nirqreturn_t azx_interrupt(int irq, void *dev_id)\n{\n\tstruct azx *chip = dev_id;\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tu32 status;\n\tbool active, handled = false;\n\tint repeat = 0; /* count for avoiding endless loop */\n\n\tif (azx_has_pm_runtime(chip))\n\t\tif (!pm_runtime_active(chip->card->dev))\n\t\t\treturn IRQ_NONE;\n\n\tguard(spinlock)(&bus->reg_lock);\n\n\tif (chip->disabled)\n\t\treturn IRQ_NONE;\n\n\tdo {\n\t\tstatus = azx_readl(chip, INTSTS);\n\t\tif (status == 0 || status == 0xffffffff)\n\t\t\tbreak;\n\n\t\thandled = true;\n\t\tactive = false;\n\t\tif (snd_hdac_bus_handle_stream_irq(bus, status, stream_update))\n\t\t\tactive = true;\n\n\t\tstatus = azx_readb(chip, RIRBSTS);\n\t\tif (status & RIRB_INT_MASK) {\n\t\t\t/*\n\t\t\t * Clearing the interrupt status here ensures that no\n\t\t\t * interrupt gets masked after the RIRB wp is read in\n\t\t\t * snd_hdac_bus_update_rirb. This avoids a possible\n\t\t\t * race condition where codec response in RIRB may\n\t\t\t * remain unserviced by IRQ, eventually falling back\n\t\t\t * to polling mode in azx_rirb_get_response.\n\t\t\t */\n\t\t\tazx_writeb(chip, RIRBSTS, RIRB_INT_MASK);\n\t\t\tactive = true;\n\t\t\tif (status & RIRB_INT_RESPONSE) {\n\t\t\t\tif (chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND)\n\t\t\t\t\tudelay(80);\n\t\t\t\tsnd_hdac_bus_update_rirb(bus);\n\t\t\t}\n\t\t}\n\t} while (active && ++repeat < 10);\n\n\treturn IRQ_RETVAL(handled);\n}\nEXPORT_SYMBOL_GPL(azx_interrupt);\n\n/*\n * Codec initerface\n */\n\n/*\n * Probe the given codec address\n */\nstatic int probe_codec(struct azx *chip, int addr)\n{\n\tunsigned int cmd = (addr << 28) | (AC_NODE_ROOT << 20) |\n\t\t(AC_VERB_PARAMETERS << 8) | AC_PAR_VENDOR_ID;\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tint err;\n\tunsigned int res = -1;\n\n\tscoped_guard(mutex, &bus->cmd_mutex) {\n\t\tchip->probing = 1;\n\t\tazx_send_cmd(bus, cmd);\n\t\terr = azx_get_response(bus, addr, &res);\n\t\tchip->probing = 0;\n\t}\n\tif (err < 0 || res == -1)\n\t\treturn -EIO;\n\tdev_dbg(chip->card->dev, \"codec #%d probed OK\\n\", addr);\n\treturn 0;\n}\n\nvoid snd_hda_bus_reset(struct hda_bus *bus)\n{\n\tstruct azx *chip = bus_to_azx(&bus->core);\n\n\tbus->in_reset = 1;\n\tazx_stop_chip(chip);\n\tazx_init_chip(chip, true);\n\tif (bus->core.chip_init)\n\t\tsnd_hda_bus_reset_codecs(bus);\n\tbus->in_reset = 0;\n}\n\n/* HD-audio bus initialization */\nint azx_bus_init(struct azx *chip, const char *model)\n{\n\tstruct hda_bus *bus = &chip->bus;\n\tint err;\n\n\terr = snd_hdac_bus_init(&bus->core, chip->card->dev, &bus_core_ops);\n\tif (err < 0)\n\t\treturn err;\n\n\tbus->card = chip->card;\n\tmutex_init(&bus->prepare_mutex);\n\tbus->pci = chip->pci;\n\tbus->modelname = model;\n\tbus->mixer_assigned = -1;\n\tbus->core.snoop = azx_snoop(chip);\n\tif (chip->get_position[0] != azx_get_pos_lpib ||\n\t    chip->get_position[1] != azx_get_pos_lpib)\n\t\tbus->core.use_posbuf = true;\n\tbus->core.bdl_pos_adj = chip->bdl_pos_adj;\n\tif (chip->driver_caps & AZX_DCAPS_CORBRP_SELF_CLEAR)\n\t\tbus->core.corbrp_self_clear = true;\n\n\tif (chip->driver_caps & AZX_DCAPS_4K_BDLE_BOUNDARY)\n\t\tbus->core.align_bdle_4k = true;\n\n\tif (chip->driver_caps & AZX_DCAPS_PIO_COMMANDS)\n\t\tbus->core.use_pio_for_commands = true;\n\n\t/* enable sync_write flag for stable communication as default */\n\tbus->core.sync_write = 1;\n\n\treturn 0;\n}\nEXPORT_SYMBOL_GPL(azx_bus_init);\n\n/* Probe codecs */\nint azx_probe_codecs(struct azx *chip, unsigned int max_slots)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tint c, codecs, err;\n\n\tcodecs = 0;\n\tif (!max_slots)\n\t\tmax_slots = AZX_DEFAULT_CODECS;\n\n\t/* First try to probe all given codec slots */\n\tfor (c = 0; c < max_slots; c++) {\n\t\tif ((bus->codec_mask & (1 << c)) & chip->codec_probe_mask) {\n\t\t\tif (probe_codec(chip, c) < 0) {\n\t\t\t\t/* Some BIOSen give you wrong codec addresses\n\t\t\t\t * that don't exist\n\t\t\t\t */\n\t\t\t\tdev_warn(chip->card->dev,\n\t\t\t\t\t \"Codec #%d probe error; disabling it...\\n\", c);\n\t\t\t\tbus->codec_mask &= ~(1 << c);\n\t\t\t\t/* no codecs */\n\t\t\t\tif (bus->codec_mask == 0)\n\t\t\t\t\tbreak;\n\t\t\t\t/* More badly, accessing to a non-existing\n\t\t\t\t * codec often screws up the controller chip,\n\t\t\t\t * and disturbs the further communications.\n\t\t\t\t * Thus if an error occurs during probing,\n\t\t\t\t * better to reset the controller chip to\n\t\t\t\t * get back to the sanity state.\n\t\t\t\t */\n\t\t\t\tazx_stop_chip(chip);\n\t\t\t\tazx_init_chip(chip, true);\n\t\t\t}\n\t\t}\n\t}\n\n\t/* Then create codec instances */\n\tfor (c = 0; c < max_slots; c++) {\n\t\tif ((bus->codec_mask & (1 << c)) & chip->codec_probe_mask) {\n\t\t\tstruct hda_codec *codec;\n\t\t\terr = snd_hda_codec_new(&chip->bus, chip->card, c, &codec);\n\t\t\tif (err < 0)\n\t\t\t\tcontinue;\n\t\t\tcodec->jackpoll_interval = chip->jackpoll_interval;\n\t\t\tcodec->beep_mode = chip->beep_mode;\n\t\t\tcodec->ctl_dev_id = chip->ctl_dev_id;\n\t\t\tcodecs++;\n\t\t}\n\t}\n\tif (!codecs) {\n\t\tdev_err(chip->card->dev, \"no codecs initialized\\n\");\n\t\treturn -ENXIO;\n\t}\n\treturn 0;\n}\nEXPORT_SYMBOL_GPL(azx_probe_codecs);\n\n/* configure each codec instance */\nint azx_codec_configure(struct azx *chip)\n{\n\tstruct hda_codec *codec, *next;\n\tint success = 0;\n\n\tlist_for_each_codec(codec, &chip->bus) {\n\t\tif (!snd_hda_codec_configure(codec))\n\t\t\tsuccess++;\n\t}\n\n\tif (success) {\n\t\t/* unregister failed codecs if any codec has been probed */\n\t\tlist_for_each_codec_safe(codec, next, &chip->bus) {\n\t\t\tif (!codec->configured) {\n\t\t\t\tcodec_err(codec, \"Unable to configure, disabling\\n\");\n\t\t\t\tsnd_hdac_device_unregister(&codec->core);\n\t\t\t}\n\t\t}\n\t}\n\n\treturn success ? 0 : -ENODEV;\n}\nEXPORT_SYMBOL_GPL(azx_codec_configure);\n\nvoid azx_add_stream(struct azx *chip, struct azx_dev *azx_dev, int idx, int tag)\n{\n\tsnd_hdac_stream_init(azx_bus(chip), azx_stream(azx_dev), idx,\n\t\t\t     azx_stream_direction(chip, idx), tag);\n}\nEXPORT_SYMBOL_GPL(azx_add_stream);\n\n/* initialize SD streams */\nint azx_init_streams(struct azx *chip)\n{\n\tint i;\n\n\t/* initialize each stream (aka device)\n\t * assign the starting bdl address to each stream (device)\n\t * and initialize\n\t */\n\tfor (i = 0; i < chip->num_streams; i++) {\n\t\tstruct azx_dev *azx_dev = kzalloc_obj(*azx_dev);\n\n\t\tif (!azx_dev)\n\t\t\treturn -ENOMEM;\n\t\tazx_add_stream(chip, azx_dev, i, i + 1);\n\t}\n\n\treturn 0;\n}\nEXPORT_SYMBOL_GPL(azx_init_streams);\n\nvoid azx_free_streams(struct azx *chip)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tstruct hdac_stream *s;\n\n\twhile (!list_empty(&bus->stream_list)) {\n\t\ts = list_first_entry(&bus->stream_list, struct hdac_stream, list);\n\t\tlist_del(&s->list);\n\t\tkfree(stream_to_azx_dev(s));\n\t}\n}\nEXPORT_SYMBOL_GPL(azx_free_streams);\n",
+      "after_text": "// SPDX-License-Identifier: GPL-2.0-or-later\n/*\n *\n *  Implementation of primary alsa driver code base for Intel HD Audio.\n *\n *  Copyright(c) 2004 Intel Corporation\n *\n *  Copyright (c) 2004 Takashi Iwai <tiwai@suse.de>\n *                     PeiSen Hou <pshou@realtek.com.tw>\n */\n\n#include <linux/clocksource.h>\n#include <linux/delay.h>\n#include <linux/interrupt.h>\n#include <linux/kernel.h>\n#include <linux/module.h>\n#include <linux/pm_runtime.h>\n#include <linux/slab.h>\n\n#ifdef CONFIG_X86\n/* for art-tsc conversion */\n#include <asm/tsc.h>\n#endif\n\n#include <sound/core.h>\n#include <sound/initval.h>\n#include <sound/pcm_params.h>\n#include \"hda_controller.h\"\n#include \"hda_local.h\"\n\n#define CREATE_TRACE_POINTS\n#include \"controller_trace.h\"\n\n/* DSP lock helpers */\n#ifdef CONFIG_SND_HDA_DSP_LOADER\n#define guard_dsp_lock(dev)\tguard(snd_hdac_dsp_lock)(azx_stream(dev))\n#else\n#define guard_dsp_lock(dev)\tdo {} while (0)\n#endif\n#define dsp_is_locked(dev)\tsnd_hdac_stream_is_locked(azx_stream(dev))\n\n/* assign a stream for the PCM */\nstatic inline struct azx_dev *\nazx_assign_device(struct azx *chip, struct snd_pcm_substream *substream)\n{\n\tstruct hdac_stream *s;\n\n\ts = snd_hdac_stream_assign(azx_bus(chip), substream);\n\tif (!s)\n\t\treturn NULL;\n\treturn stream_to_azx_dev(s);\n}\n\n/* release the assigned stream */\nstatic inline void azx_release_device(struct azx_dev *azx_dev)\n{\n\tsnd_hdac_stream_release(azx_stream(azx_dev));\n}\n\nstatic inline struct hda_pcm_stream *\nto_hda_pcm_stream(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\treturn &apcm->info->stream[substream->stream];\n}\n\nstatic u64 azx_adjust_codec_delay(struct snd_pcm_substream *substream,\n\t\t\t\tu64 nsec)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tu64 codec_frames, codec_nsecs;\n\n\tif (!hinfo->ops.get_delay)\n\t\treturn nsec;\n\n\tcodec_frames = hinfo->ops.get_delay(hinfo, apcm->codec, substream);\n\tcodec_nsecs = div_u64(codec_frames * 1000000000LL,\n\t\t\t      substream->runtime->rate);\n\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE)\n\t\treturn nsec + codec_nsecs;\n\n\treturn (nsec > codec_nsecs) ? nsec - codec_nsecs : 0;\n}\n\n/*\n * PCM ops\n */\n\nstatic int azx_pcm_close(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\n\ttrace_azx_pcm_close(chip, azx_dev);\n\tscoped_guard(mutex, &chip->open_mutex) {\n\t\tif (chip->ops->pcm_close)\n\t\t\tchip->ops->pcm_close(chip, azx_dev);\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\tsnd_hda_power_down(apcm->codec);\n\t}\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn 0;\n}\n\nstatic int azx_pcm_hw_params(struct snd_pcm_substream *substream,\n\t\t\t     struct snd_pcm_hw_params *hw_params)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct hdac_stream *hdas = azx_stream(azx_dev);\n\n\ttrace_azx_pcm_hw_params(chip, azx_dev);\n\tguard_dsp_lock(azx_dev);\n\tif (dsp_is_locked(azx_dev))\n\t\treturn -EBUSY;\n\n\t/* Set up BDLEs here, return -ENOMEM if too many BDLEs are required */\n\thdas->bufsize = params_buffer_bytes(hw_params);\n\thdas->period_bytes = params_period_bytes(hw_params);\n\thdas->format_val = 0;\n\thdas->no_period_wakeup =\n\t\t(hw_params->info & SNDRV_PCM_INFO_NO_PERIOD_WAKEUP) &&\n\t\t(hw_params->flags & SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP);\n\tif (snd_hdac_stream_setup_periods(hdas) < 0)\n\t\treturn -ENOMEM;\n\n\treturn 0;\n}\n\nstatic int azx_pcm_hw_free(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\n\t/* reset BDL address */\n\tguard_dsp_lock(azx_dev);\n\tif (!dsp_is_locked(azx_dev))\n\t\tsnd_hdac_stream_cleanup(azx_stream(azx_dev));\n\n\tsnd_hda_codec_cleanup(apcm->codec, hinfo, substream);\n\n\tazx_stream(azx_dev)->prepared = 0;\n\treturn 0;\n}\n\nstatic int azx_pcm_prepare(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tunsigned int format_val, stream_tag, bits;\n\tint err;\n\tstruct hda_spdif_out *spdif =\n\t\tsnd_hda_spdif_out_of_nid(apcm->codec, hinfo->nid);\n\tunsigned short ctls = spdif ? spdif->ctls : 0;\n\n\ttrace_azx_pcm_prepare(chip, azx_dev);\n\tguard_dsp_lock(azx_dev);\n\tif (dsp_is_locked(azx_dev))\n\t\treturn -EBUSY;\n\n\tsnd_hdac_stream_reset(azx_stream(azx_dev));\n\tbits = snd_hdac_stream_format_bits(runtime->format, SNDRV_PCM_SUBFORMAT_STD, hinfo->maxbps);\n\n\tformat_val = snd_hdac_spdif_stream_format(runtime->channels, bits, runtime->rate, ctls);\n\tif (!format_val) {\n\t\tdev_err(chip->card->dev,\n\t\t\t\"invalid format_val, rate=%d, ch=%d, format=%d\\n\",\n\t\t\truntime->rate, runtime->channels, runtime->format);\n\t\treturn -EINVAL;\n\t}\n\n\terr = snd_hdac_stream_set_params(azx_stream(azx_dev), format_val);\n\tif (err < 0)\n\t\treturn err;\n\n\tsnd_hdac_stream_setup(azx_stream(azx_dev), false);\n\n\tstream_tag = azx_dev->core.stream_tag;\n\t/* CA-IBG chips need the playback stream starting from 1 */\n\tif ((chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND) &&\n\t    stream_tag > chip->capture_streams)\n\t\tstream_tag -= chip->capture_streams;\n\terr = snd_hda_codec_prepare(apcm->codec, hinfo, stream_tag,\n\t\t\t\t     azx_dev->core.format_val, substream);\n\tif (err < 0)\n\t\treturn err;\n\n\tazx_stream(azx_dev)->prepared = 1;\n\treturn 0;\n}\n\nstatic int azx_pcm_trigger(struct snd_pcm_substream *substream, int cmd)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_substream *s;\n\tstruct hdac_stream *hstr;\n\tbool start;\n\tint sbits = 0;\n\tint sync_reg;\n\n\tazx_dev = get_azx_dev(substream);\n\ttrace_azx_pcm_trigger(chip, azx_dev, cmd);\n\n\thstr = azx_stream(azx_dev);\n\tif (chip->driver_caps & AZX_DCAPS_OLD_SSYNC)\n\t\tsync_reg = AZX_REG_OLD_SSYNC;\n\telse\n\t\tsync_reg = AZX_REG_SSYNC;\n\n\tif (dsp_is_locked(azx_dev) || !hstr->prepared)\n\t\treturn -EPIPE;\n\n\tswitch (cmd) {\n\tcase SNDRV_PCM_TRIGGER_START:\n\tcase SNDRV_PCM_TRIGGER_PAUSE_RELEASE:\n\tcase SNDRV_PCM_TRIGGER_RESUME:\n\t\tstart = true;\n\t\tbreak;\n\tcase SNDRV_PCM_TRIGGER_PAUSE_PUSH:\n\tcase SNDRV_PCM_TRIGGER_SUSPEND:\n\tcase SNDRV_PCM_TRIGGER_STOP:\n\t\tstart = false;\n\t\tbreak;\n\tdefault:\n\t\treturn -EINVAL;\n\t}\n\n\tsnd_pcm_group_for_each_entry(s, substream) {\n\t\tif (s->pcm->card != substream->pcm->card)\n\t\t\tcontinue;\n\t\tazx_dev = get_azx_dev(s);\n\t\tsbits |= 1 << azx_dev->core.index;\n\t\tsnd_pcm_trigger_done(s, substream);\n\t}\n\n\tscoped_guard(spinlock, &bus->reg_lock) {\n\t\t/* first, set SYNC bits of corresponding streams */\n\t\tsnd_hdac_stream_sync_trigger(hstr, true, sbits, sync_reg);\n\n\t\tsnd_pcm_group_for_each_entry(s, substream) {\n\t\t\tif (s->pcm->card != substream->pcm->card)\n\t\t\t\tcontinue;\n\t\t\tazx_dev = get_azx_dev(s);\n\t\t\tif (start) {\n\t\t\t\tazx_dev->insufficient = 1;\n\t\t\t\tsnd_hdac_stream_start(azx_stream(azx_dev));\n\t\t\t} else {\n\t\t\t\tsnd_hdac_stream_stop(azx_stream(azx_dev));\n\t\t\t}\n\t\t}\n\t}\n\n\tsnd_hdac_stream_sync(hstr, start, sbits);\n\n\tguard(spinlock)(&bus->reg_lock);\n\t/* reset SYNC bits */\n\tsnd_hdac_stream_sync_trigger(hstr, false, sbits, sync_reg);\n\tsnd_hdac_stream_timecounter_init(hstr, sbits, start);\n\treturn 0;\n}\n\nunsigned int azx_get_pos_lpib(struct azx *chip, struct azx_dev *azx_dev)\n{\n\treturn snd_hdac_stream_get_pos_lpib(azx_stream(azx_dev));\n}\nEXPORT_SYMBOL_GPL(azx_get_pos_lpib);\n\nunsigned int azx_get_pos_posbuf(struct azx *chip, struct azx_dev *azx_dev)\n{\n\treturn snd_hdac_stream_get_pos_posbuf(azx_stream(azx_dev));\n}\nEXPORT_SYMBOL_GPL(azx_get_pos_posbuf);\n\nunsigned int azx_get_position(struct azx *chip,\n\t\t\t      struct azx_dev *azx_dev)\n{\n\tstruct snd_pcm_substream *substream = azx_dev->core.substream;\n\tunsigned int pos;\n\tint stream = substream->stream;\n\tint delay = 0;\n\n\tif (chip->get_position[stream])\n\t\tpos = chip->get_position[stream](chip, azx_dev);\n\telse /* use the position buffer as default */\n\t\tpos = azx_get_pos_posbuf(chip, azx_dev);\n\n\tif (pos >= azx_dev->core.bufsize)\n\t\tpos = 0;\n\n\tif (substream->runtime) {\n\t\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\t\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\n\t\tif (chip->get_delay[stream])\n\t\t\tdelay += chip->get_delay[stream](chip, azx_dev, pos);\n\t\tif (hinfo->ops.get_delay)\n\t\t\tdelay += hinfo->ops.get_delay(hinfo, apcm->codec,\n\t\t\t\t\t\t      substream);\n\t\tsubstream->runtime->delay = delay;\n\t}\n\n\ttrace_azx_get_position(chip, azx_dev, pos, delay);\n\treturn pos;\n}\nEXPORT_SYMBOL_GPL(azx_get_position);\n\nstatic snd_pcm_uframes_t azx_pcm_pointer(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\treturn bytes_to_frames(substream->runtime,\n\t\t\t       azx_get_position(chip, azx_dev));\n}\n\n/*\n * azx_scale64: Scale base by mult/div while not overflowing sanely\n *\n * Derived from scale64_check_overflow in kernel/time/timekeeping.c\n *\n * The tmestamps for a 48Khz stream can overflow after (2^64/10^9)/48K which\n * is about 384307 ie ~4.5 days.\n *\n * This scales the calculation so that overflow will happen but after 2^64 /\n * 48000 secs, which is pretty large!\n *\n * In caln below:\n *\tbase may overflow, but since there isn\u2019t any additional division\n *\tperformed on base it\u2019s OK\n *\trem can\u2019t overflow because both are 32-bit values\n */\n\n#ifdef CONFIG_X86\nstatic u64 azx_scale64(u64 base, u32 num, u32 den)\n{\n\tu64 rem;\n\n\trem = do_div(base, den);\n\n\tbase *= num;\n\trem *= num;\n\n\tdo_div(rem, den);\n\n\treturn base + rem;\n}\n\nstatic int azx_get_sync_time(ktime_t *device,\n\t\tstruct system_counterval_t *system, void *ctx)\n{\n\tstruct snd_pcm_substream *substream = ctx;\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct snd_pcm_runtime *runtime;\n\tu64 ll_counter, ll_counter_l, ll_counter_h;\n\tu64 tsc_counter, tsc_counter_l, tsc_counter_h;\n\tu32 wallclk_ctr, wallclk_cycles;\n\tbool direction;\n\tu32 dma_select;\n\tu32 timeout;\n\tu32 retry_count = 0;\n\n\truntime = substream->runtime;\n\n\tif (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)\n\t\tdirection = 1;\n\telse\n\t\tdirection = 0;\n\n\t/* 0th stream tag is not used, so DMA ch 0 is for 1st stream tag */\n\tdo {\n\t\ttimeout = 100;\n\t\tdma_select = (direction << GTSCC_CDMAS_DMA_DIR_SHIFT) |\n\t\t\t\t\t(azx_dev->core.stream_tag - 1);\n\t\tsnd_hdac_chip_writel(azx_bus(chip), GTSCC, dma_select);\n\n\t\t/* Enable the capture */\n\t\tsnd_hdac_chip_updatel(azx_bus(chip), GTSCC, 0, GTSCC_TSCCI_MASK);\n\n\t\twhile (timeout) {\n\t\t\tif (snd_hdac_chip_readl(azx_bus(chip), GTSCC) &\n\t\t\t\t\t\tGTSCC_TSCCD_MASK)\n\t\t\t\tbreak;\n\n\t\t\ttimeout--;\n\t\t}\n\n\t\tif (!timeout) {\n\t\t\tdev_err(chip->card->dev, \"GTSCC capture Timedout!\\n\");\n\t\t\treturn -EIO;\n\t\t}\n\n\t\t/* Read wall clock counter */\n\t\twallclk_ctr = snd_hdac_chip_readl(azx_bus(chip), WALFCC);\n\n\t\t/* Read TSC counter */\n\t\ttsc_counter_l = snd_hdac_chip_readl(azx_bus(chip), TSCCL);\n\t\ttsc_counter_h = snd_hdac_chip_readl(azx_bus(chip), TSCCU);\n\n\t\t/* Read Link counter */\n\t\tll_counter_l = snd_hdac_chip_readl(azx_bus(chip), LLPCL);\n\t\tll_counter_h = snd_hdac_chip_readl(azx_bus(chip), LLPCU);\n\n\t\t/* Ack: registers read done */\n\t\tsnd_hdac_chip_writel(azx_bus(chip), GTSCC, GTSCC_TSCCD_SHIFT);\n\n\t\ttsc_counter = (tsc_counter_h << TSCCU_CCU_SHIFT) |\n\t\t\t\t\t\ttsc_counter_l;\n\n\t\tll_counter = (ll_counter_h << LLPC_CCU_SHIFT) |\tll_counter_l;\n\t\twallclk_cycles = wallclk_ctr & WALFCC_CIF_MASK;\n\n\t\t/*\n\t\t * An error occurs near frame \"rollover\". The clocks in\n\t\t * frame value indicates whether this error may have\n\t\t * occurred. Here we use the value of 10 i.e.,\n\t\t * HDA_MAX_CYCLE_OFFSET\n\t\t */\n\t\tif (wallclk_cycles < HDA_MAX_CYCLE_VALUE - HDA_MAX_CYCLE_OFFSET\n\t\t\t\t\t&& wallclk_cycles > HDA_MAX_CYCLE_OFFSET)\n\t\t\tbreak;\n\n\t\t/*\n\t\t * Sleep before we read again, else we may again get\n\t\t * value near to MAX_CYCLE. Try to sleep for different\n\t\t * amount of time so we dont hit the same number again\n\t\t */\n\t\tudelay(retry_count++);\n\n\t} while (retry_count != HDA_MAX_CYCLE_READ_RETRY);\n\n\tif (retry_count == HDA_MAX_CYCLE_READ_RETRY) {\n\t\tdev_err_ratelimited(chip->card->dev,\n\t\t\t\"Error in WALFCC cycle count\\n\");\n\t\treturn -EIO;\n\t}\n\n\t*device = ns_to_ktime(azx_scale64(ll_counter,\n\t\t\t\tNSEC_PER_SEC, runtime->rate));\n\t*device = ktime_add_ns(*device, (wallclk_cycles * NSEC_PER_SEC) /\n\t\t\t       ((HDA_MAX_CYCLE_VALUE + 1) * runtime->rate));\n\n\tsystem->cycles = tsc_counter;\n\tsystem->cs_id = CSID_X86_ART;\n\n\treturn 0;\n}\n\n#else\nstatic int azx_get_sync_time(ktime_t *device,\n\t\tstruct system_counterval_t *system, void *ctx)\n{\n\treturn -ENXIO;\n}\n#endif\n\nstatic int azx_get_crosststamp(struct snd_pcm_substream *substream,\n\t\t\t      struct system_device_crosststamp *xtstamp)\n{\n\treturn get_device_system_crosststamp(azx_get_sync_time,\n\t\t\t\t\tsubstream, NULL, xtstamp);\n}\n\nstatic inline bool is_link_time_supported(struct snd_pcm_runtime *runtime,\n\t\t\t\tstruct snd_pcm_audio_tstamp_config *ts)\n{\n\tif (runtime->hw.info & SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME)\n\t\tif (ts->type_requested == SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED)\n\t\t\treturn true;\n\n\treturn false;\n}\n\nstatic int azx_get_time_info(struct snd_pcm_substream *substream,\n\t\t\tstruct timespec64 *system_ts, struct timespec64 *audio_ts,\n\t\t\tstruct snd_pcm_audio_tstamp_config *audio_tstamp_config,\n\t\t\tstruct snd_pcm_audio_tstamp_report *audio_tstamp_report)\n{\n\tstruct system_device_crosststamp xtstamp = { .clock_id = CLOCK_REALTIME };\n\tstruct azx_dev *azx_dev = get_azx_dev(substream);\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint ret;\n\tu64 nsec;\n\n\tif ((substream->runtime->hw.info & SNDRV_PCM_INFO_HAS_LINK_ATIME) &&\n\t\t(audio_tstamp_config->type_requested == SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK)) {\n\n\t\tsnd_pcm_gettime(substream->runtime, system_ts);\n\n\t\tnsec = timecounter_read(&azx_dev->core.tc);\n\t\tif (audio_tstamp_config->report_delay)\n\t\t\tnsec = azx_adjust_codec_delay(substream, nsec);\n\n\t\t*audio_ts = ns_to_timespec64(nsec);\n\n\t\taudio_tstamp_report->actual_type = SNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK;\n\t\taudio_tstamp_report->accuracy_report = 1; /* rest of structure is valid */\n\t\taudio_tstamp_report->accuracy = 42; /* 24 MHz WallClock == 42ns resolution */\n\n\t} else if (is_link_time_supported(runtime, audio_tstamp_config)) {\n\n\t\tret = azx_get_crosststamp(substream, &xtstamp);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tswitch (runtime->tstamp_type) {\n\t\tcase SNDRV_PCM_TSTAMP_TYPE_MONOTONIC:\n\t\t\treturn -EINVAL;\n\n\t\tcase SNDRV_PCM_TSTAMP_TYPE_MONOTONIC_RAW:\n\t\t\t*system_ts = ktime_to_timespec64(xtstamp.sys_monoraw);\n\t\t\tbreak;\n\n\t\tdefault:\n\t\t\t*system_ts = ktime_to_timespec64(xtstamp.sys_systime);\n\t\t\tbreak;\n\n\t\t}\n\n\t\t*audio_ts = ktime_to_timespec64(xtstamp.device);\n\n\t\taudio_tstamp_report->actual_type =\n\t\t\tSNDRV_PCM_AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED;\n\t\taudio_tstamp_report->accuracy_report = 1;\n\t\t/* 24 MHz WallClock == 42ns resolution */\n\t\taudio_tstamp_report->accuracy = 42;\n\n\t} else {\n\t\taudio_tstamp_report->actual_type = SNDRV_PCM_AUDIO_TSTAMP_TYPE_DEFAULT;\n\t}\n\n\treturn 0;\n}\n\nstatic const struct snd_pcm_hardware azx_pcm_hw = {\n\t.info =\t\t\t(SNDRV_PCM_INFO_MMAP |\n\t\t\t\t SNDRV_PCM_INFO_INTERLEAVED |\n\t\t\t\t SNDRV_PCM_INFO_BLOCK_TRANSFER |\n\t\t\t\t SNDRV_PCM_INFO_MMAP_VALID |\n\t\t\t\t /* No full-resume yet implemented */\n\t\t\t\t /* SNDRV_PCM_INFO_RESUME |*/\n\t\t\t\t SNDRV_PCM_INFO_PAUSE |\n\t\t\t\t SNDRV_PCM_INFO_SYNC_START |\n\t\t\t\t SNDRV_PCM_INFO_HAS_WALL_CLOCK | /* legacy */\n\t\t\t\t SNDRV_PCM_INFO_HAS_LINK_ATIME |\n\t\t\t\t SNDRV_PCM_INFO_NO_PERIOD_WAKEUP),\n\t.formats =\t\tSNDRV_PCM_FMTBIT_S16_LE,\n\t.rates =\t\tSNDRV_PCM_RATE_48000,\n\t.rate_min =\t\t48000,\n\t.rate_max =\t\t48000,\n\t.channels_min =\t\t2,\n\t.channels_max =\t\t2,\n\t.buffer_bytes_max =\tAZX_MAX_BUF_SIZE,\n\t.period_bytes_min =\t128,\n\t.period_bytes_max =\tAZX_MAX_BUF_SIZE / 2,\n\t.periods_min =\t\t2,\n\t.periods_max =\t\tAZX_MAX_FRAG,\n\t.fifo_size =\t\t0,\n};\n\nstatic int azx_pcm_open(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint err;\n\tint buff_step;\n\n\tsnd_hda_codec_pcm_get(apcm->info);\n\tmutex_lock(&chip->open_mutex);\n\tazx_dev = azx_assign_device(chip, substream);\n\tif (azx_dev == NULL) {\n\t\terr = -EBUSY;\n\t\tgoto unlock;\n\t}\n\ttrace_azx_pcm_open(chip, azx_dev);\n\truntime->private_data = azx_dev;\n\n\truntime->hw = azx_pcm_hw;\n\tif (chip->gts_present)\n\t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n\truntime->hw.channels_min = hinfo->channels_min;\n\truntime->hw.channels_max = hinfo->channels_max;\n\truntime->hw.formats = hinfo->formats;\n\truntime->hw.rates = hinfo->rates;\n\tsnd_pcm_limit_hw_rates(runtime);\n\tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n\n\t/* avoid wrap-around with wall-clock */\n\tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n\t\t\t\t     20,\n\t\t\t\t     178000000);\n\n\tif (chip->align_buffer_size)\n\t\t/* constrain buffer sizes to be multiple of 128\n\t\t   bytes. This is more efficient in terms of memory\n\t\t   access but isn't required by the HDA spec and\n\t\t   prevents users from specifying exact period/buffer\n\t\t   sizes. For example for 44.1kHz, a period size set\n\t\t   to 20ms will be rounded to 19.59ms. */\n\t\tbuff_step = 128;\n\telse\n\t\t/* Don't enforce steps on buffer sizes, still need to\n\t\t   be multiple of 4 bytes (HDA spec). Tested on Intel\n\t\t   HDA controllers, may not work on all devices where\n\t\t   option needs to be disabled */\n\t\tbuff_step = 4;\n\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_hda_power_up(apcm->codec);\n\tif (hinfo->ops.open)\n\t\terr = hinfo->ops.open(hinfo, apcm->codec, substream);\n\telse\n\t\terr = -ENODEV;\n\tif (err < 0) {\n\t\tazx_release_device(azx_dev);\n\t\tgoto powerdown;\n\t}\n\tsnd_pcm_limit_hw_rates(runtime);\n\t/* sanity check */\n\tif (snd_BUG_ON(!runtime->hw.channels_min) ||\n\t    snd_BUG_ON(!runtime->hw.channels_max) ||\n\t    snd_BUG_ON(!runtime->hw.formats) ||\n\t    snd_BUG_ON(!runtime->hw.rates)) {\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\terr = -EINVAL;\n\t\tgoto powerdown;\n\t}\n\n\t/* disable LINK_ATIME timestamps for capture streams\n\t   until we figure out how to handle digital inputs */\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_WALL_CLOCK; /* legacy */\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_LINK_ATIME;\n\t}\n\n\tsnd_pcm_set_sync(substream);\n\tmutex_unlock(&chip->open_mutex);\n\treturn 0;\n\n powerdown:\n\tsnd_hda_power_down(apcm->codec);\n unlock:\n\tmutex_unlock(&chip->open_mutex);\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn err;\n}\n\nstatic const struct snd_pcm_ops azx_pcm_ops = {\n\t.open = azx_pcm_open,\n\t.close = azx_pcm_close,\n\t.hw_params = azx_pcm_hw_params,\n\t.hw_free = azx_pcm_hw_free,\n\t.prepare = azx_pcm_prepare,\n\t.trigger = azx_pcm_trigger,\n\t.pointer = azx_pcm_pointer,\n\t.get_time_info =  azx_get_time_info,\n};\n\nstatic void azx_pcm_free(struct snd_pcm *pcm)\n{\n\tstruct azx_pcm *apcm = pcm->private_data;\n\tif (apcm) {\n\t\tlist_del(&apcm->list);\n\t\tapcm->info->pcm = NULL;\n\t\tkfree(apcm);\n\t}\n}\n\n#define MAX_PREALLOC_SIZE\t(32 * 1024 * 1024)\n\nint snd_hda_attach_pcm_stream(struct hda_bus *_bus, struct hda_codec *codec,\n\t\t\t      struct hda_pcm *cpcm)\n{\n\tstruct hdac_bus *bus = &_bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct snd_pcm *pcm;\n\tstruct azx_pcm *apcm;\n\tint pcm_dev = cpcm->device;\n\tunsigned int size;\n\tint s, err;\n\tint type = SNDRV_DMA_TYPE_DEV_SG;\n\n\tlist_for_each_entry(apcm, &chip->pcm_list, list) {\n\t\tif (apcm->pcm->device == pcm_dev) {\n\t\t\tdev_err(chip->card->dev, \"PCM %d already exists\\n\",\n\t\t\t\tpcm_dev);\n\t\t\treturn -EBUSY;\n\t\t}\n\t}\n\terr = snd_pcm_new(chip->card, cpcm->name, pcm_dev,\n\t\t\t  cpcm->stream[SNDRV_PCM_STREAM_PLAYBACK].substreams,\n\t\t\t  cpcm->stream[SNDRV_PCM_STREAM_CAPTURE].substreams,\n\t\t\t  &pcm);\n\tif (err < 0)\n\t\treturn err;\n\tstrscpy(pcm->name, cpcm->name, sizeof(pcm->name));\n\tapcm = kzalloc_obj(*apcm);\n\tif (apcm == NULL) {\n\t\tsnd_device_free(chip->card, pcm);\n\t\treturn -ENOMEM;\n\t}\n\tapcm->chip = chip;\n\tapcm->pcm = pcm;\n\tapcm->codec = codec;\n\tapcm->info = cpcm;\n\tpcm->private_data = apcm;\n\tpcm->private_free = azx_pcm_free;\n\tif (cpcm->pcm_type == HDA_PCM_TYPE_MODEM)\n\t\tpcm->dev_class = SNDRV_PCM_CLASS_MODEM;\n\tlist_add_tail(&apcm->list, &chip->pcm_list);\n\tcpcm->pcm = pcm;\n\tfor (s = 0; s < 2; s++) {\n\t\tif (cpcm->stream[s].substreams)\n\t\t\tsnd_pcm_set_ops(pcm, s, &azx_pcm_ops);\n\t}\n\t/* buffer pre-allocation */\n\tsize = CONFIG_SND_HDA_PREALLOC_SIZE * 1024;\n\tif (size > MAX_PREALLOC_SIZE)\n\t\tsize = MAX_PREALLOC_SIZE;\n\tif (chip->uc_buffer)\n\t\ttype = SNDRV_DMA_TYPE_DEV_WC_SG;\n\tsnd_pcm_set_managed_buffer_all(pcm, type, chip->card->dev,\n\t\t\t\t       size, MAX_PREALLOC_SIZE);\n\treturn 0;\n}\n\nstatic unsigned int azx_command_addr(u32 cmd)\n{\n\tunsigned int addr = cmd >> 28;\n\n\tif (addr >= AZX_MAX_CODECS) {\n\t\tsnd_BUG();\n\t\taddr = 0;\n\t}\n\n\treturn addr;\n}\n\n/* receive a response */\nstatic int azx_rirb_get_response(struct hdac_bus *bus, unsigned int addr,\n\t\t\t\t unsigned int *res)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct hda_bus *hbus = &chip->bus;\n\tint err;\n\n again:\n\terr = snd_hdac_bus_get_response(bus, addr, res);\n\tif (!err)\n\t\treturn 0;\n\n\tif (hbus->no_response_fallback)\n\t\treturn -EIO;\n\n\tif (!bus->polling_mode) {\n\t\tdev_warn(chip->card->dev,\n\t\t\t \"azx_get_response timeout, switching to polling mode: last cmd=0x%08x\\n\",\n\t\t\t bus->last_cmd[addr]);\n\t\tbus->polling_mode = 1;\n\t\tgoto again;\n\t}\n\n\tif (chip->msi) {\n\t\tdev_warn(chip->card->dev,\n\t\t\t \"No response from codec, disabling MSI: last cmd=0x%08x\\n\",\n\t\t\t bus->last_cmd[addr]);\n\t\tif (chip->ops->disable_msi_reset_irq &&\n\t\t    chip->ops->disable_msi_reset_irq(chip) < 0)\n\t\t\treturn -EIO;\n\t\tgoto again;\n\t}\n\n\tif (chip->probing) {\n\t\t/* If this critical timeout happens during the codec probing\n\t\t * phase, this is likely an access to a non-existing codec\n\t\t * slot.  Better to return an error and reset the system.\n\t\t */\n\t\treturn -EIO;\n\t}\n\n\t/* no fallback mechanism? */\n\tif (!chip->fallback_to_single_cmd)\n\t\treturn -EIO;\n\n\t/* a fatal communication error; need either to reset or to fallback\n\t * to the single_cmd mode\n\t */\n\tif (hbus->allow_bus_reset && !hbus->response_reset && !hbus->in_reset) {\n\t\thbus->response_reset = 1;\n\t\tdev_err(chip->card->dev,\n\t\t\t\"No response from codec, resetting bus: last cmd=0x%08x\\n\",\n\t\t\tbus->last_cmd[addr]);\n\t\treturn -EAGAIN; /* give a chance to retry */\n\t}\n\n\tdev_err(chip->card->dev,\n\t\t\"azx_get_response timeout, switching to single_cmd mode: last cmd=0x%08x\\n\",\n\t\tbus->last_cmd[addr]);\n\tchip->single_cmd = 1;\n\thbus->response_reset = 0;\n\tsnd_hdac_bus_stop_cmd_io(bus);\n\treturn -EIO;\n}\n\n/*\n * Use the single immediate command instead of CORB/RIRB for simplicity\n *\n * Note: according to Intel, this is not preferred use.  The command was\n *       intended for the BIOS only, and may get confused with unsolicited\n *       responses.  So, we shouldn't use it for normal operation from the\n *       driver.\n *       I left the codes, however, for debugging/testing purposes.\n */\n\n/* receive a response */\nstatic int azx_single_wait_for_response(struct azx *chip, unsigned int addr)\n{\n\tint timeout = 50;\n\n\twhile (timeout--) {\n\t\t/* check IRV busy bit */\n\t\tif (azx_readw(chip, IRS) & AZX_IRS_VALID) {\n\t\t\t/* reuse rirb.res as the response return value */\n\t\t\tazx_bus(chip)->rirb.res[addr] = azx_readl(chip, IR);\n\t\t\treturn 0;\n\t\t}\n\t\tudelay(1);\n\t}\n\tif (printk_ratelimit())\n\t\tdev_dbg(chip->card->dev, \"get_response timeout: IRS=0x%x\\n\",\n\t\t\tazx_readw(chip, IRS));\n\tazx_bus(chip)->rirb.res[addr] = -1;\n\treturn -EIO;\n}\n\n/* send a command */\nstatic int azx_single_send_cmd(struct hdac_bus *bus, u32 val)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\tunsigned int addr = azx_command_addr(val);\n\tint timeout = 50;\n\n\tbus->last_cmd[azx_command_addr(val)] = val;\n\twhile (timeout--) {\n\t\t/* check ICB busy bit */\n\t\tif (!((azx_readw(chip, IRS) & AZX_IRS_BUSY))) {\n\t\t\t/* Clear IRV valid bit */\n\t\t\tazx_writew(chip, IRS, azx_readw(chip, IRS) |\n\t\t\t\t   AZX_IRS_VALID);\n\t\t\tazx_writel(chip, IC, val);\n\t\t\tazx_writew(chip, IRS, azx_readw(chip, IRS) |\n\t\t\t\t   AZX_IRS_BUSY);\n\t\t\treturn azx_single_wait_for_response(chip, addr);\n\t\t}\n\t\tudelay(1);\n\t}\n\tif (printk_ratelimit())\n\t\tdev_dbg(chip->card->dev,\n\t\t\t\"send_cmd timeout: IRS=0x%x, val=0x%x\\n\",\n\t\t\tazx_readw(chip, IRS), val);\n\treturn -EIO;\n}\n\n/* receive a response */\nstatic int azx_single_get_response(struct hdac_bus *bus, unsigned int addr,\n\t\t\t\t   unsigned int *res)\n{\n\tif (res)\n\t\t*res = bus->rirb.res[addr];\n\treturn 0;\n}\n\n/*\n * The below are the main callbacks from hda_codec.\n *\n * They are just the skeleton to call sub-callbacks according to the\n * current setting of chip->single_cmd.\n */\n\n/* send a command */\nstatic int azx_send_cmd(struct hdac_bus *bus, unsigned int val)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\n\tif (chip->disabled)\n\t\treturn 0;\n\tif (chip->single_cmd || bus->use_pio_for_commands)\n\t\treturn azx_single_send_cmd(bus, val);\n\telse\n\t\treturn snd_hdac_bus_send_cmd(bus, val);\n}\n\n/* get a response */\nstatic int azx_get_response(struct hdac_bus *bus, unsigned int addr,\n\t\t\t    unsigned int *res)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\n\tif (chip->disabled)\n\t\treturn 0;\n\tif (chip->single_cmd || bus->use_pio_for_commands)\n\t\treturn azx_single_get_response(bus, addr, res);\n\telse\n\t\treturn azx_rirb_get_response(bus, addr, res);\n}\n\nstatic const struct hdac_bus_ops bus_core_ops = {\n\t.command = azx_send_cmd,\n\t.get_response = azx_get_response,\n};\n\n#ifdef CONFIG_SND_HDA_DSP_LOADER\n/*\n * DSP loading code (e.g. for CA0132)\n */\n\n/* use the first stream for loading DSP */\nstatic struct azx_dev *\nazx_get_dsp_loader_dev(struct azx *chip)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tstruct hdac_stream *s;\n\n\tlist_for_each_entry(s, &bus->stream_list, list)\n\t\tif (s->index == chip->playback_index_offset)\n\t\t\treturn stream_to_azx_dev(s);\n\n\treturn NULL;\n}\n\nint snd_hda_codec_load_dsp_prepare(struct hda_codec *codec, unsigned int format,\n\t\t\t\t   unsigned int byte_size,\n\t\t\t\t   struct snd_dma_buffer *bufp)\n{\n\tstruct hdac_bus *bus = &codec->bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev;\n\tstruct hdac_stream *hstr;\n\tbool saved = false;\n\tint err;\n\n\tazx_dev = azx_get_dsp_loader_dev(chip);\n\thstr = azx_stream(azx_dev);\n\tscoped_guard(spinlock_irq, &bus->reg_lock) {\n\t\tif (hstr->opened) {\n\t\t\tchip->saved_azx_dev = *azx_dev;\n\t\t\tsaved = true;\n\t\t}\n\t}\n\n\terr = snd_hdac_dsp_prepare(hstr, format, byte_size, bufp);\n\tif (err < 0) {\n\t\tguard(spinlock_irq)(&bus->reg_lock);\n\t\tif (saved)\n\t\t\t*azx_dev = chip->saved_azx_dev;\n\t\treturn err;\n\t}\n\n\thstr->prepared = 0;\n\treturn err;\n}\nEXPORT_SYMBOL_GPL(snd_hda_codec_load_dsp_prepare);\n\nvoid snd_hda_codec_load_dsp_trigger(struct hda_codec *codec, bool start)\n{\n\tstruct hdac_bus *bus = &codec->bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev = azx_get_dsp_loader_dev(chip);\n\n\tsnd_hdac_dsp_trigger(azx_stream(azx_dev), start);\n}\nEXPORT_SYMBOL_GPL(snd_hda_codec_load_dsp_trigger);\n\nvoid snd_hda_codec_load_dsp_cleanup(struct hda_codec *codec,\n\t\t\t\t    struct snd_dma_buffer *dmab)\n{\n\tstruct hdac_bus *bus = &codec->bus->core;\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev = azx_get_dsp_loader_dev(chip);\n\tstruct hdac_stream *hstr = azx_stream(azx_dev);\n\n\tif (!dmab->area || !hstr->locked)\n\t\treturn;\n\n\tsnd_hdac_dsp_cleanup(hstr, dmab);\n\tguard(spinlock_irq)(&bus->reg_lock);\n\tif (hstr->opened)\n\t\t*azx_dev = chip->saved_azx_dev;\n\thstr->locked = false;\n}\nEXPORT_SYMBOL_GPL(snd_hda_codec_load_dsp_cleanup);\n#endif /* CONFIG_SND_HDA_DSP_LOADER */\n\n/*\n * reset and start the controller registers\n */\nvoid azx_init_chip(struct azx *chip, bool full_reset)\n{\n\tif (snd_hdac_bus_init_chip(azx_bus(chip), full_reset)) {\n\t\t/* correct RINTCNT for CXT */\n\t\tif (chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND)\n\t\t\tazx_writew(chip, RINTCNT, 0xc0);\n\t}\n}\nEXPORT_SYMBOL_GPL(azx_init_chip);\n\nvoid azx_stop_all_streams(struct azx *chip)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\n\tsnd_hdac_stop_streams(bus);\n}\nEXPORT_SYMBOL_GPL(azx_stop_all_streams);\n\nvoid azx_stop_chip(struct azx *chip)\n{\n\tsnd_hdac_bus_stop_chip(azx_bus(chip));\n}\nEXPORT_SYMBOL_GPL(azx_stop_chip);\n\n/*\n * interrupt handler\n */\nstatic void stream_update(struct hdac_bus *bus, struct hdac_stream *s)\n{\n\tstruct azx *chip = bus_to_azx(bus);\n\tstruct azx_dev *azx_dev = stream_to_azx_dev(s);\n\n\t/* check whether this IRQ is really acceptable */\n\tif (!chip->ops->position_check ||\n\t    chip->ops->position_check(chip, azx_dev)) {\n\t\tspin_unlock(&bus->reg_lock);\n\t\tsnd_pcm_period_elapsed(azx_stream(azx_dev)->substream);\n\t\tspin_lock(&bus->reg_lock);\n\t}\n}\n\nirqreturn_t azx_interrupt(int irq, void *dev_id)\n{\n\tstruct azx *chip = dev_id;\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tu32 status;\n\tbool active, handled = false;\n\tint repeat = 0; /* count for avoiding endless loop */\n\n\tif (azx_has_pm_runtime(chip))\n\t\tif (!pm_runtime_active(chip->card->dev))\n\t\t\treturn IRQ_NONE;\n\n\tguard(spinlock)(&bus->reg_lock);\n\n\tif (chip->disabled)\n\t\treturn IRQ_NONE;\n\n\tdo {\n\t\tstatus = azx_readl(chip, INTSTS);\n\t\tif (status == 0 || status == 0xffffffff)\n\t\t\tbreak;\n\n\t\thandled = true;\n\t\tactive = false;\n\t\tif (snd_hdac_bus_handle_stream_irq(bus, status, stream_update))\n\t\t\tactive = true;\n\n\t\tstatus = azx_readb(chip, RIRBSTS);\n\t\tif (status & RIRB_INT_MASK) {\n\t\t\t/*\n\t\t\t * Clearing the interrupt status here ensures that no\n\t\t\t * interrupt gets masked after the RIRB wp is read in\n\t\t\t * snd_hdac_bus_update_rirb. This avoids a possible\n\t\t\t * race condition where codec response in RIRB may\n\t\t\t * remain unserviced by IRQ, eventually falling back\n\t\t\t * to polling mode in azx_rirb_get_response.\n\t\t\t */\n\t\t\tazx_writeb(chip, RIRBSTS, RIRB_INT_MASK);\n\t\t\tactive = true;\n\t\t\tif (status & RIRB_INT_RESPONSE) {\n\t\t\t\tif (chip->driver_caps & AZX_DCAPS_CTX_WORKAROUND)\n\t\t\t\t\tudelay(80);\n\t\t\t\tsnd_hdac_bus_update_rirb(bus);\n\t\t\t}\n\t\t}\n\t} while (active && ++repeat < 10);\n\n\treturn IRQ_RETVAL(handled);\n}\nEXPORT_SYMBOL_GPL(azx_interrupt);\n\n/*\n * Codec initerface\n */\n\n/*\n * Probe the given codec address\n */\nstatic int probe_codec(struct azx *chip, int addr)\n{\n\tunsigned int cmd = (addr << 28) | (AC_NODE_ROOT << 20) |\n\t\t(AC_VERB_PARAMETERS << 8) | AC_PAR_VENDOR_ID;\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tint err;\n\tunsigned int res = -1;\n\n\tscoped_guard(mutex, &bus->cmd_mutex) {\n\t\tchip->probing = 1;\n\t\tazx_send_cmd(bus, cmd);\n\t\terr = azx_get_response(bus, addr, &res);\n\t\tchip->probing = 0;\n\t}\n\tif (err < 0 || res == -1)\n\t\treturn -EIO;\n\tdev_dbg(chip->card->dev, \"codec #%d probed OK\\n\", addr);\n\treturn 0;\n}\n\nvoid snd_hda_bus_reset(struct hda_bus *bus)\n{\n\tstruct azx *chip = bus_to_azx(&bus->core);\n\n\tbus->in_reset = 1;\n\tazx_stop_chip(chip);\n\tazx_init_chip(chip, true);\n\tif (bus->core.chip_init)\n\t\tsnd_hda_bus_reset_codecs(bus);\n\tbus->in_reset = 0;\n}\n\n/* HD-audio bus initialization */\nint azx_bus_init(struct azx *chip, const char *model)\n{\n\tstruct hda_bus *bus = &chip->bus;\n\tint err;\n\n\terr = snd_hdac_bus_init(&bus->core, chip->card->dev, &bus_core_ops);\n\tif (err < 0)\n\t\treturn err;\n\n\tbus->card = chip->card;\n\tmutex_init(&bus->prepare_mutex);\n\tbus->pci = chip->pci;\n\tbus->modelname = model;\n\tbus->mixer_assigned = -1;\n\tbus->core.snoop = azx_snoop(chip);\n\tif (chip->get_position[0] != azx_get_pos_lpib ||\n\t    chip->get_position[1] != azx_get_pos_lpib)\n\t\tbus->core.use_posbuf = true;\n\tbus->core.bdl_pos_adj = chip->bdl_pos_adj;\n\tif (chip->driver_caps & AZX_DCAPS_CORBRP_SELF_CLEAR)\n\t\tbus->core.corbrp_self_clear = true;\n\n\tif (chip->driver_caps & AZX_DCAPS_4K_BDLE_BOUNDARY)\n\t\tbus->core.align_bdle_4k = true;\n\n\tif (chip->driver_caps & AZX_DCAPS_PIO_COMMANDS)\n\t\tbus->core.use_pio_for_commands = true;\n\n\t/* enable sync_write flag for stable communication as default */\n\tbus->core.sync_write = 1;\n\n\treturn 0;\n}\nEXPORT_SYMBOL_GPL(azx_bus_init);\n\n/* Probe codecs */\nint azx_probe_codecs(struct azx *chip, unsigned int max_slots)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tint c, codecs, err;\n\n\tcodecs = 0;\n\tif (!max_slots)\n\t\tmax_slots = AZX_DEFAULT_CODECS;\n\n\t/* First try to probe all given codec slots */\n\tfor (c = 0; c < max_slots; c++) {\n\t\tif ((bus->codec_mask & (1 << c)) & chip->codec_probe_mask) {\n\t\t\tif (probe_codec(chip, c) < 0) {\n\t\t\t\t/* Some BIOSen give you wrong codec addresses\n\t\t\t\t * that don't exist\n\t\t\t\t */\n\t\t\t\tdev_warn(chip->card->dev,\n\t\t\t\t\t \"Codec #%d probe error; disabling it...\\n\", c);\n\t\t\t\tbus->codec_mask &= ~(1 << c);\n\t\t\t\t/* no codecs */\n\t\t\t\tif (bus->codec_mask == 0)\n\t\t\t\t\tbreak;\n\t\t\t\t/* More badly, accessing to a non-existing\n\t\t\t\t * codec often screws up the controller chip,\n\t\t\t\t * and disturbs the further communications.\n\t\t\t\t * Thus if an error occurs during probing,\n\t\t\t\t * better to reset the controller chip to\n\t\t\t\t * get back to the sanity state.\n\t\t\t\t */\n\t\t\t\tazx_stop_chip(chip);\n\t\t\t\tazx_init_chip(chip, true);\n\t\t\t}\n\t\t}\n\t}\n\n\t/* Then create codec instances */\n\tfor (c = 0; c < max_slots; c++) {\n\t\tif ((bus->codec_mask & (1 << c)) & chip->codec_probe_mask) {\n\t\t\tstruct hda_codec *codec;\n\t\t\terr = snd_hda_codec_new(&chip->bus, chip->card, c, &codec);\n\t\t\tif (err < 0)\n\t\t\t\tcontinue;\n\t\t\tcodec->jackpoll_interval = chip->jackpoll_interval;\n\t\t\tcodec->beep_mode = chip->beep_mode;\n\t\t\tcodec->ctl_dev_id = chip->ctl_dev_id;\n\t\t\tcodecs++;\n\t\t}\n\t}\n\tif (!codecs) {\n\t\tdev_err(chip->card->dev, \"no codecs initialized\\n\");\n\t\treturn -ENXIO;\n\t}\n\treturn 0;\n}\nEXPORT_SYMBOL_GPL(azx_probe_codecs);\n\n/* configure each codec instance */\nint azx_codec_configure(struct azx *chip)\n{\n\tstruct hda_codec *codec, *next;\n\tint success = 0;\n\n\tlist_for_each_codec(codec, &chip->bus) {\n\t\tif (!snd_hda_codec_configure(codec))\n\t\t\tsuccess++;\n\t}\n\n\tif (success) {\n\t\t/* unregister failed codecs if any codec has been probed */\n\t\tlist_for_each_codec_safe(codec, next, &chip->bus) {\n\t\t\tif (!codec->configured) {\n\t\t\t\tcodec_err(codec, \"Unable to configure, disabling\\n\");\n\t\t\t\tsnd_hdac_device_unregister(&codec->core);\n\t\t\t}\n\t\t}\n\t}\n\n\treturn success ? 0 : -ENODEV;\n}\nEXPORT_SYMBOL_GPL(azx_codec_configure);\n\nvoid azx_add_stream(struct azx *chip, struct azx_dev *azx_dev, int idx, int tag)\n{\n\tsnd_hdac_stream_init(azx_bus(chip), azx_stream(azx_dev), idx,\n\t\t\t     azx_stream_direction(chip, idx), tag);\n}\nEXPORT_SYMBOL_GPL(azx_add_stream);\n\n/* initialize SD streams */\nint azx_init_streams(struct azx *chip)\n{\n\tint i;\n\n\t/* initialize each stream (aka device)\n\t * assign the starting bdl address to each stream (device)\n\t * and initialize\n\t */\n\tfor (i = 0; i < chip->num_streams; i++) {\n\t\tstruct azx_dev *azx_dev = kzalloc_obj(*azx_dev);\n\n\t\tif (!azx_dev)\n\t\t\treturn -ENOMEM;\n\t\tazx_add_stream(chip, azx_dev, i, i + 1);\n\t}\n\n\treturn 0;\n}\nEXPORT_SYMBOL_GPL(azx_init_streams);\n\nvoid azx_free_streams(struct azx *chip)\n{\n\tstruct hdac_bus *bus = azx_bus(chip);\n\tstruct hdac_stream *s;\n\n\twhile (!list_empty(&bus->stream_list)) {\n\t\ts = list_first_entry(&bus->stream_list, struct hdac_stream, list);\n\t\tlist_del(&s->list);\n\t\tkfree(stream_to_azx_dev(s));\n\t}\n}\nEXPORT_SYMBOL_GPL(azx_free_streams);\n",
+      "before_lines": [
+        589
+      ],
+      "after_lines": [
+        593
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "name": "azx_pcm_open",
+      "before": {
+        "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+        "path": "sound/hda/common/controller.c",
+        "start_line": 576,
+        "end_line": 669,
+        "kind": "function",
+        "symbol": "azx_pcm_open",
+        "reason": "changed function or its pre-fix counterpart",
+        "text": "static int azx_pcm_open(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint err;\n\tint buff_step;\n\n\tsnd_hda_codec_pcm_get(apcm->info);\n\tmutex_lock(&chip->open_mutex);\n\tazx_dev = azx_assign_device(chip, substream);\n\ttrace_azx_pcm_open(chip, azx_dev);\n\tif (azx_dev == NULL) {\n\t\terr = -EBUSY;\n\t\tgoto unlock;\n\t}\n\truntime->private_data = azx_dev;\n\n\truntime->hw = azx_pcm_hw;\n\tif (chip->gts_present)\n\t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n\truntime->hw.channels_min = hinfo->channels_min;\n\truntime->hw.channels_max = hinfo->channels_max;\n\truntime->hw.formats = hinfo->formats;\n\truntime->hw.rates = hinfo->rates;\n\tsnd_pcm_limit_hw_rates(runtime);\n\tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n\n\t/* avoid wrap-around with wall-clock */\n\tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n\t\t\t\t     20,\n\t\t\t\t     178000000);\n\n\tif (chip->align_buffer_size)\n\t\t/* constrain buffer sizes to be multiple of 128\n\t\t   bytes. This is more efficient in terms of memory\n\t\t   access but isn't required by the HDA spec and\n\t\t   prevents users from specifying exact period/buffer\n\t\t   sizes. For example for 44.1kHz, a period size set\n\t\t   to 20ms will be rounded to 19.59ms. */\n\t\tbuff_step = 128;\n\telse\n\t\t/* Don't enforce steps on buffer sizes, still need to\n\t\t   be multiple of 4 bytes (HDA spec). Tested on Intel\n\t\t   HDA controllers, may not work on all devices where\n\t\t   option needs to be disabled */\n\t\tbuff_step = 4;\n\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_hda_power_up(apcm->codec);\n\tif (hinfo->ops.open)\n\t\terr = hinfo->ops.open(hinfo, apcm->codec, substream);\n\telse\n\t\terr = -ENODEV;\n\tif (err < 0) {\n\t\tazx_release_device(azx_dev);\n\t\tgoto powerdown;\n\t}\n\tsnd_pcm_limit_hw_rates(runtime);\n\t/* sanity check */\n\tif (snd_BUG_ON(!runtime->hw.channels_min) ||\n\t    snd_BUG_ON(!runtime->hw.channels_max) ||\n\t    snd_BUG_ON(!runtime->hw.formats) ||\n\t    snd_BUG_ON(!runtime->hw.rates)) {\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\terr = -EINVAL;\n\t\tgoto powerdown;\n\t}\n\n\t/* disable LINK_ATIME timestamps for capture streams\n\t   until we figure out how to handle digital inputs */\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_WALL_CLOCK; /* legacy */\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_LINK_ATIME;\n\t}\n\n\tsnd_pcm_set_sync(substream);\n\tmutex_unlock(&chip->open_mutex);\n\treturn 0;\n\n powerdown:\n\tsnd_hda_power_down(apcm->codec);\n unlock:\n\tmutex_unlock(&chip->open_mutex);\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn err;\n}"
+      },
+      "after": {
+        "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+        "path": "sound/hda/common/controller.c",
+        "start_line": 576,
+        "end_line": 669,
+        "kind": "function",
+        "symbol": "azx_pcm_open",
+        "reason": "changed function or its post-fix counterpart",
+        "text": "static int azx_pcm_open(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint err;\n\tint buff_step;\n\n\tsnd_hda_codec_pcm_get(apcm->info);\n\tmutex_lock(&chip->open_mutex);\n\tazx_dev = azx_assign_device(chip, substream);\n\tif (azx_dev == NULL) {\n\t\terr = -EBUSY;\n\t\tgoto unlock;\n\t}\n\ttrace_azx_pcm_open(chip, azx_dev);\n\truntime->private_data = azx_dev;\n\n\truntime->hw = azx_pcm_hw;\n\tif (chip->gts_present)\n\t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n\truntime->hw.channels_min = hinfo->channels_min;\n\truntime->hw.channels_max = hinfo->channels_max;\n\truntime->hw.formats = hinfo->formats;\n\truntime->hw.rates = hinfo->rates;\n\tsnd_pcm_limit_hw_rates(runtime);\n\tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n\n\t/* avoid wrap-around with wall-clock */\n\tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n\t\t\t\t     20,\n\t\t\t\t     178000000);\n\n\tif (chip->align_buffer_size)\n\t\t/* constrain buffer sizes to be multiple of 128\n\t\t   bytes. This is more efficient in terms of memory\n\t\t   access but isn't required by the HDA spec and\n\t\t   prevents users from specifying exact period/buffer\n\t\t   sizes. For example for 44.1kHz, a period size set\n\t\t   to 20ms will be rounded to 19.59ms. */\n\t\tbuff_step = 128;\n\telse\n\t\t/* Don't enforce steps on buffer sizes, still need to\n\t\t   be multiple of 4 bytes (HDA spec). Tested on Intel\n\t\t   HDA controllers, may not work on all devices where\n\t\t   option needs to be disabled */\n\t\tbuff_step = 4;\n\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_hda_power_up(apcm->codec);\n\tif (hinfo->ops.open)\n\t\terr = hinfo->ops.open(hinfo, apcm->codec, substream);\n\telse\n\t\terr = -ENODEV;\n\tif (err < 0) {\n\t\tazx_release_device(azx_dev);\n\t\tgoto powerdown;\n\t}\n\tsnd_pcm_limit_hw_rates(runtime);\n\t/* sanity check */\n\tif (snd_BUG_ON(!runtime->hw.channels_min) ||\n\t    snd_BUG_ON(!runtime->hw.channels_max) ||\n\t    snd_BUG_ON(!runtime->hw.formats) ||\n\t    snd_BUG_ON(!runtime->hw.rates)) {\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\terr = -EINVAL;\n\t\tgoto powerdown;\n\t}\n\n\t/* disable LINK_ATIME timestamps for capture streams\n\t   until we figure out how to handle digital inputs */\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_WALL_CLOCK; /* legacy */\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_LINK_ATIME;\n\t}\n\n\tsnd_pcm_set_sync(substream);\n\tmutex_unlock(&chip->open_mutex);\n\treturn 0;\n\n powerdown:\n\tsnd_hda_power_down(apcm->codec);\n unlock:\n\tmutex_unlock(&chip->open_mutex);\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn err;\n}"
+      }
+    }
+  ],
+  "fallback": [],
+  "supplements": [
+    {
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/sound/pcm.h",
+      "start_line": 21,
+      "end_line": 21,
+      "kind": "macro",
+      "symbol": "snd_pcm_substream_chip",
+      "reason": "referenced by changed code: snd_pcm_substream_chip",
+      "text": "#define snd_pcm_substream_chip(substream) ((substream)->private_data)"
+    },
+    {
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/sound/pcm.h",
+      "start_line": 21,
+      "end_line": 21,
+      "kind": "macro",
+      "symbol": "snd_pcm_substream_chip",
+      "reason": "referenced by changed code: snd_pcm_substream_chip",
+      "text": "#define snd_pcm_substream_chip(substream) ((substream)->private_data)"
+    },
+    {
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/controller.c",
+      "start_line": 60,
+      "end_line": 65,
+      "kind": "function",
+      "symbol": "to_hda_pcm_stream",
+      "reason": "referenced by changed code: to_hda_pcm_stream",
+      "text": "static inline struct hda_pcm_stream *\nto_hda_pcm_stream(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\treturn &apcm->info->stream[substream->stream];\n}"
+    },
+    {
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "sound/hda/common/controller.c",
+      "start_line": 60,
+      "end_line": 65,
+      "kind": "function",
+      "symbol": "to_hda_pcm_stream",
+      "reason": "referenced by changed code: to_hda_pcm_stream",
+      "text": "static inline struct hda_pcm_stream *\nto_hda_pcm_stream(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\treturn &apcm->info->stream[substream->stream];\n}"
+    },
+    {
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/sound/hda_codec.h",
+      "start_line": 440,
+      "end_line": 443,
+      "kind": "function",
+      "symbol": "snd_hda_codec_pcm_get",
+      "reason": "referenced by changed code: snd_hda_codec_pcm_get",
+      "text": "static inline void snd_hda_codec_pcm_get(struct hda_pcm *pcm)\n{\n\tsnd_refcount_get(&pcm->codec->pcm_ref);\n}"
+    },
+    {
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/sound/hda_codec.h",
+      "start_line": 440,
+      "end_line": 443,
+      "kind": "function",
+      "symbol": "snd_hda_codec_pcm_get",
+      "reason": "referenced by changed code: snd_hda_codec_pcm_get",
+      "text": "static inline void snd_hda_codec_pcm_get(struct hda_pcm *pcm)\n{\n\tsnd_refcount_get(&pcm->codec->pcm_ref);\n}"
+    },
+    {
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/sound/core.h",
+      "start_line": 91,
+      "end_line": 94,
+      "kind": "function",
+      "symbol": "snd_refcount_get",
+      "reason": "one-level callee of snd_hda_codec_pcm_get",
+      "text": "static inline void snd_refcount_get(struct snd_refcount *ref)\n{\n\tatomic_inc(&ref->count);\n}"
+    },
+    {
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/sound/core.h",
+      "start_line": 91,
+      "end_line": 94,
+      "kind": "function",
+      "symbol": "snd_refcount_get",
+      "reason": "one-level callee of snd_hda_codec_pcm_get",
+      "text": "static inline void snd_refcount_get(struct snd_refcount *ref)\n{\n\tatomic_inc(&ref->count);\n}"
+    },
+    {
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/controller.c",
+      "start_line": 43,
+      "end_line": 52,
+      "kind": "function",
+      "symbol": "azx_assign_device",
+      "reason": "referenced by changed code: azx_assign_device",
+      "text": "static inline struct azx_dev *\nazx_assign_device(struct azx *chip, struct snd_pcm_substream *substream)\n{\n\tstruct hdac_stream *s;\n\n\ts = snd_hdac_stream_assign(azx_bus(chip), substream);\n\tif (!s)\n\t\treturn NULL;\n\treturn stream_to_azx_dev(s);\n}"
+    },
+    {
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "sound/hda/common/controller.c",
+      "start_line": 43,
+      "end_line": 52,
+      "kind": "function",
+      "symbol": "azx_assign_device",
+      "reason": "referenced by changed code: azx_assign_device",
+      "text": "static inline struct azx_dev *\nazx_assign_device(struct azx *chip, struct snd_pcm_substream *substream)\n{\n\tstruct hdac_stream *s;\n\n\ts = snd_hdac_stream_assign(azx_bus(chip), substream);\n\tif (!s)\n\t\treturn NULL;\n\treturn stream_to_azx_dev(s);\n}"
+    },
+    {
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/hda_controller.h",
+      "start_line": 152,
+      "end_line": 152,
+      "kind": "macro",
+      "symbol": "azx_bus",
+      "reason": "one-level callee of azx_assign_device",
+      "text": "#define azx_bus(chip)\t(&(chip)->bus.core)"
+    },
+    {
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/hda_controller.h",
+      "start_line": 69,
+      "end_line": 69,
+      "kind": "macro",
+      "symbol": "stream_to_azx_dev",
+      "reason": "one-level callee of azx_assign_device",
+      "text": "#define stream_to_azx_dev(s)\tcontainer_of(s, struct azx_dev, core)"
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/controller.c",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "sound/hda/common/controller.c",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/tsc.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/controller.c",
+      "line": 22
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/clocksource.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/div64.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/clocksource.h",
+      "line": 21
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/io.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/clocksource.h",
+      "line": 22
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/clocksource.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/clocksource.h",
+      "line": 29
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/delay.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/delay.h",
+      "line": 18
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/interrupt.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/ptrace.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/interrupt.h",
+      "line": 20
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irq.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/interrupt.h",
+      "line": 21
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/sections.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/interrupt.h",
+      "line": 22
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kernel.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kernel.h",
+      "line": 38
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/module.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/module.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/module.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/pm_runtime.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/slab.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/sound/core.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/hda_local.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "sound/hda/common/controller_trace.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/param.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/timex.h",
+      "line": 63
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/timex.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/timex.h",
+      "line": 67
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/time.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/list.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/list.h",
+      "line": 11
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/cache.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/cache.h",
+      "line": 7
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/init.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/of.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/of.h",
+      "line": 23
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/prom.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/of.h",
+      "line": 252
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/vdso/clocksource.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/vdso/clocksource.h",
+      "line": 7
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/math.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/div64.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/math.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/sched.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/current.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/sched.h",
+      "line": 12
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/sched.h",
+      "line": 13
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/kmap_size.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/sched.h",
+      "line": 52
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve generated/rq-offsets.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/sched.h",
+      "line": 55
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/jiffies.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/param.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/jiffies.h",
+      "line": 13
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve generated/timeconst.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/jiffies.h",
+      "line": 14
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/bitops.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/bitops.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bitops.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/bitops.h",
+      "line": 67
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/cleanup.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/irqnr.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hardirq.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hardirq.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hardirq.h",
+      "line": 11
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/irqflags.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irqflags.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/irqflags.h",
+      "line": 18
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/irqflags.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hrtimer.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kref.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/cpumask_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/workqueue.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/jump_label.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/jump_label.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/jump_label.h",
+      "line": 106
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/atomic.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/atomic.h",
+      "line": 7
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/atomic.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/linkage.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/linkage.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/linkage.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/stddef.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/rwonce.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/compiler.h",
+      "line": 369
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kstrtox.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/log2.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/panic.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/printk.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/sprintf.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/trace_printk.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/sysinfo.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/uapi/linux/kernel.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/stat.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/stat.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kmod.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/elf.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/elf.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/stringify.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kobject.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/export.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/rbtree_latch.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/tracepoint-defs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/srcu.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/dynamic_debug.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/percpu.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/percpu.h",
+      "line": 15
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/device.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/device.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/device.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/notifier.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/bug.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bug.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/bug.h",
+      "line": 5
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/gfp.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/overflow.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/rcupdate.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/rcupdate.h",
+      "line": 31
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/percpu-refcount.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hash.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hash.h",
+      "line": 6
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hash.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hash.h",
+      "line": 46
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kasan.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/kasan.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kasan.h",
+      "line": 21
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/alloc_tag.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/alloc_tag.h",
+      "line": 12
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/mutex.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/current.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/mutex.h",
+      "line": 14
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/mutex.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/rwsem.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/xarray.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/sound/pcm.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/sound/hda_codec.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/tracepoint.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Non-literal include is not resolved",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/trace/define_trace.h",
+      "line": 118
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/uapi/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/uapi/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/uapi/linux/timex.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/uapi/linux/timex.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/math64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/math64.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/time64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/time64.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/time32.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/time32.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/vdso/time.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/const.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/vdso/cache.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/ktime.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/ktime.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/debugobjects.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/timer_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/errno.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/property.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/property.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/uapi/linux/sched.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/thread_info.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/thread_info.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/preempt.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/preempt.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/futex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/futex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/smp_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/shm.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/shm.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/kmsan_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/mutex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/mutex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/plist_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hrtimer_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/hrtimer_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/seccomp_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/nodemask_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/nodemask_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/refcount_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": "include/linux/resource.h",
+      "line": null
+    },
+    {
+      "code": "source_file_limit",
+      "message": "Local source search file budget reached",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/tsc.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "sound/hda/common/controller.c",
+      "line": 22
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/clocksource.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/div64.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/clocksource.h",
+      "line": 21
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/io.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/clocksource.h",
+      "line": 22
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/clocksource.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/clocksource.h",
+      "line": 29
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/delay.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/delay.h",
+      "line": 18
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/interrupt.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/ptrace.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/interrupt.h",
+      "line": 20
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irq.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/interrupt.h",
+      "line": 21
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/sections.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/interrupt.h",
+      "line": 22
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kernel.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kernel.h",
+      "line": 38
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/module.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/module.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/module.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/pm_runtime.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/slab.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/sound/core.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "sound/hda/common/hda_local.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "sound/hda/common/controller_trace.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/param.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/timex.h",
+      "line": 63
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/timex.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/timex.h",
+      "line": 67
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/time.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/list.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/list.h",
+      "line": 11
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/cache.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/cache.h",
+      "line": 7
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/init.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/of.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/of.h",
+      "line": 23
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/prom.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/of.h",
+      "line": 252
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/vdso/clocksource.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/vdso/clocksource.h",
+      "line": 7
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/math.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/div64.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/math.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/sched.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/current.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/sched.h",
+      "line": 12
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/sched.h",
+      "line": 13
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/kmap_size.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/sched.h",
+      "line": 52
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve generated/rq-offsets.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/sched.h",
+      "line": 55
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/jiffies.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/param.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/jiffies.h",
+      "line": 13
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve generated/timeconst.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/jiffies.h",
+      "line": 14
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/bitops.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/bitops.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bitops.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/bitops.h",
+      "line": 67
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/cleanup.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/irqnr.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hardirq.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hardirq.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hardirq.h",
+      "line": 11
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/irqflags.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irqflags.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/irqflags.h",
+      "line": 18
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/irqflags.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hrtimer.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kref.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/cpumask_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/workqueue.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/jump_label.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/jump_label.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/jump_label.h",
+      "line": 106
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/atomic.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/atomic.h",
+      "line": 7
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/atomic.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/linkage.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/linkage.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/linkage.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/stddef.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/rwonce.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/compiler.h",
+      "line": 369
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kstrtox.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/log2.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/panic.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/printk.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/sprintf.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/trace_printk.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/sysinfo.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/uapi/linux/kernel.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/stat.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/stat.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kmod.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/elf.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/elf.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/stringify.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kobject.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/export.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/rbtree_latch.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/tracepoint-defs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/srcu.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/dynamic_debug.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/percpu.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/percpu.h",
+      "line": 15
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/device.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/device.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/device.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/notifier.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/bug.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bug.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/bug.h",
+      "line": 5
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/gfp.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/overflow.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/rcupdate.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/rcupdate.h",
+      "line": 31
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/percpu-refcount.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hash.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hash.h",
+      "line": 6
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hash.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hash.h",
+      "line": 46
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kasan.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/kasan.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kasan.h",
+      "line": 21
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/alloc_tag.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/alloc_tag.h",
+      "line": 12
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/mutex.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/current.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/mutex.h",
+      "line": 14
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/mutex.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/rwsem.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/xarray.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/sound/pcm.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/sound/hda_codec.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/tracepoint.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Non-literal include is not resolved",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/trace/define_trace.h",
+      "line": 118
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/uapi/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/uapi/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/uapi/linux/timex.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/uapi/linux/timex.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/math64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/math64.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/time64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/time64.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/time32.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/time32.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/vdso/time.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/const.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/vdso/cache.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/ktime.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/ktime.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/debugobjects.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/timer_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/errno.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/property.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/property.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/uapi/linux/sched.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/thread_info.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/thread_info.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/preempt.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/preempt.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/futex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/futex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/smp_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/shm.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/shm.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/kmsan_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/mutex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/mutex_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/plist_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hrtimer_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/hrtimer_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/seccomp_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/nodemask_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/nodemask_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/refcount_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": "include/linux/resource.h",
+      "line": null
+    },
+    {
+      "code": "source_file_limit",
+      "message": "Local source search file budget reached",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "symbol_ambiguous",
+      "message": "mutex_lock: 2 local matches",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "symbol_ambiguous",
+      "message": "mutex_lock: 2 local matches",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "symbol_unresolved",
+      "message": "snd_hdac_stream_assign: 0 local matches",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "supplement_entry_limit",
+      "message": "Supplement entry budget reached",
+      "revision": null,
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "symbol_unresolved",
+      "message": "trace_azx_pcm_open: 0 local matches",
+      "revision": "5ab3dc647751996784cff20a51f3730f4e88afe4",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "symbol_unresolved",
+      "message": "trace_azx_pcm_open: 0 local matches",
+      "revision": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "root_symbol_limit",
+      "message": "Supplement root budget reached",
+      "revision": null,
+      "path": null,
+      "line": null
+    }
+  ],
+  "limits": {
+    "include_depth": 3,
+    "source_files": 128,
+    "seed_symbols": 32,
+    "root_symbols": 6,
+    "supplement_entries": 12,
+    "wrapper_lines": 24,
+    "source_bytes": 2097152,
+    "markdown_chars": 32000
+  },
+  "markdown": "# Repair commit context\n\nCommit: `c9e6e5f38bf75276605f1952b22285f5f3abcaff`\n\nParent: `5ab3dc647751996784cff20a51f3730f4e88afe4`\n\n## Commit message\n\n### Description\n\n```text\nALSA: hda: trace PCM open only after assigning a stream\n\nStream assignment can fail when hardware streams are exhausted.\nMove the tracepoint after the NULL check because its payload accesses\nthe assigned stream tag.\n\nDetected by static analysis and reviewed with AI-assisted source auditing.\n\nFixes: 184865085b88 (\"ALSA: hda - rename hda_intel_trace.h to hda_controller_trace.h\")\nAssisted-by: LLM\nSigned-off-by: Slavin Liu <bolin.liu@seu.edu.cn>\nLink: https://patch.msgid.link/20260913125154.109944-1-bolin.liu@seu.edu.cn\nSigned-off-by: Takashi Iwai <tiwai@suse.de>\n```\n\n## Patch diff\n\n### Historical diff\n\n```diff\ndiff --git a/sound/hda/common/controller.c b/sound/hda/common/controller.c\nindex afec5c5546ec..18dae022b324 100644\n--- a/sound/hda/common/controller.c\n+++ b/sound/hda/common/controller.c\n@@ -569,45 +569,45 @@ static const struct snd_pcm_hardware azx_pcm_hw = {\n \t.period_bytes_min =\t128,\n \t.period_bytes_max =\tAZX_MAX_BUF_SIZE / 2,\n \t.periods_min =\t\t2,\n \t.periods_max =\t\tAZX_MAX_FRAG,\n \t.fifo_size =\t\t0,\n };\n \n static int azx_pcm_open(struct snd_pcm_substream *substream)\n {\n \tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n \tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n \tstruct azx *chip = apcm->chip;\n \tstruct azx_dev *azx_dev;\n \tstruct snd_pcm_runtime *runtime = substream->runtime;\n \tint err;\n \tint buff_step;\n \n \tsnd_hda_codec_pcm_get(apcm->info);\n \tmutex_lock(&chip->open_mutex);\n \tazx_dev = azx_assign_device(chip, substream);\n-\ttrace_azx_pcm_open(chip, azx_dev);\n \tif (azx_dev == NULL) {\n \t\terr = -EBUSY;\n \t\tgoto unlock;\n \t}\n+\ttrace_azx_pcm_open(chip, azx_dev);\n \truntime->private_data = azx_dev;\n \n \truntime->hw = azx_pcm_hw;\n \tif (chip->gts_present)\n \t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n \truntime->hw.channels_min = hinfo->channels_min;\n \truntime->hw.channels_max = hinfo->channels_max;\n \truntime->hw.formats = hinfo->formats;\n \truntime->hw.rates = hinfo->rates;\n \tsnd_pcm_limit_hw_rates(runtime);\n \tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n \n \t/* avoid wrap-around with wall-clock */\n \tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n \t\t\t\t     20,\n \t\t\t\t     178000000);\n \n \tif (chip->align_buffer_size)\n \t\t/* constrain buffer sizes to be multiple of 128\n \t\t   bytes. This is more efficient in terms of memory\n\n```\n\n## Changed source\n\n### function 'azx_pcm_open' \u2014 'sound/hda/common/controller.c':576-669 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (changed function or its pre-fix counterpart)\n\n```c\nstatic int azx_pcm_open(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint err;\n\tint buff_step;\n\n\tsnd_hda_codec_pcm_get(apcm->info);\n\tmutex_lock(&chip->open_mutex);\n\tazx_dev = azx_assign_device(chip, substream);\n\ttrace_azx_pcm_open(chip, azx_dev);\n\tif (azx_dev == NULL) {\n\t\terr = -EBUSY;\n\t\tgoto unlock;\n\t}\n\truntime->private_data = azx_dev;\n\n\truntime->hw = azx_pcm_hw;\n\tif (chip->gts_present)\n\t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n\truntime->hw.channels_min = hinfo->channels_min;\n\truntime->hw.channels_max = hinfo->channels_max;\n\truntime->hw.formats = hinfo->formats;\n\truntime->hw.rates = hinfo->rates;\n\tsnd_pcm_limit_hw_rates(runtime);\n\tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n\n\t/* avoid wrap-around with wall-clock */\n\tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n\t\t\t\t     20,\n\t\t\t\t     178000000);\n\n\tif (chip->align_buffer_size)\n\t\t/* constrain buffer sizes to be multiple of 128\n\t\t   bytes. This is more efficient in terms of memory\n\t\t   access but isn't required by the HDA spec and\n\t\t   prevents users from specifying exact period/buffer\n\t\t   sizes. For example for 44.1kHz, a period size set\n\t\t   to 20ms will be rounded to 19.59ms. */\n\t\tbuff_step = 128;\n\telse\n\t\t/* Don't enforce steps on buffer sizes, still need to\n\t\t   be multiple of 4 bytes (HDA spec). Tested on Intel\n\t\t   HDA controllers, may not work on all devices where\n\t\t   option needs to be disabled */\n\t\tbuff_step = 4;\n\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_hda_power_up(apcm->codec);\n\tif (hinfo->ops.open)\n\t\terr = hinfo->ops.open(hinfo, apcm->codec, substream);\n\telse\n\t\terr = -ENODEV;\n\tif (err < 0) {\n\t\tazx_release_device(azx_dev);\n\t\tgoto powerdown;\n\t}\n\tsnd_pcm_limit_hw_rates(runtime);\n\t/* sanity check */\n\tif (snd_BUG_ON(!runtime->hw.channels_min) ||\n\t    snd_BUG_ON(!runtime->hw.channels_max) ||\n\t    snd_BUG_ON(!runtime->hw.formats) ||\n\t    snd_BUG_ON(!runtime->hw.rates)) {\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\terr = -EINVAL;\n\t\tgoto powerdown;\n\t}\n\n\t/* disable LINK_ATIME timestamps for capture streams\n\t   until we figure out how to handle digital inputs */\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_WALL_CLOCK; /* legacy */\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_LINK_ATIME;\n\t}\n\n\tsnd_pcm_set_sync(substream);\n\tmutex_unlock(&chip->open_mutex);\n\treturn 0;\n\n powerdown:\n\tsnd_hda_power_down(apcm->codec);\n unlock:\n\tmutex_unlock(&chip->open_mutex);\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn err;\n}\n```\n\n### function 'azx_pcm_open' \u2014 'sound/hda/common/controller.c':576-669 @ c9e6e5f38bf75276605f1952b22285f5f3abcaff (changed function or its post-fix counterpart)\n\n```c\nstatic int azx_pcm_open(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\tstruct hda_pcm_stream *hinfo = to_hda_pcm_stream(substream);\n\tstruct azx *chip = apcm->chip;\n\tstruct azx_dev *azx_dev;\n\tstruct snd_pcm_runtime *runtime = substream->runtime;\n\tint err;\n\tint buff_step;\n\n\tsnd_hda_codec_pcm_get(apcm->info);\n\tmutex_lock(&chip->open_mutex);\n\tazx_dev = azx_assign_device(chip, substream);\n\tif (azx_dev == NULL) {\n\t\terr = -EBUSY;\n\t\tgoto unlock;\n\t}\n\ttrace_azx_pcm_open(chip, azx_dev);\n\truntime->private_data = azx_dev;\n\n\truntime->hw = azx_pcm_hw;\n\tif (chip->gts_present)\n\t\truntime->hw.info |= SNDRV_PCM_INFO_HAS_LINK_SYNCHRONIZED_ATIME;\n\truntime->hw.channels_min = hinfo->channels_min;\n\truntime->hw.channels_max = hinfo->channels_max;\n\truntime->hw.formats = hinfo->formats;\n\truntime->hw.rates = hinfo->rates;\n\tsnd_pcm_limit_hw_rates(runtime);\n\tsnd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);\n\n\t/* avoid wrap-around with wall-clock */\n\tsnd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_TIME,\n\t\t\t\t     20,\n\t\t\t\t     178000000);\n\n\tif (chip->align_buffer_size)\n\t\t/* constrain buffer sizes to be multiple of 128\n\t\t   bytes. This is more efficient in terms of memory\n\t\t   access but isn't required by the HDA spec and\n\t\t   prevents users from specifying exact period/buffer\n\t\t   sizes. For example for 44.1kHz, a period size set\n\t\t   to 20ms will be rounded to 19.59ms. */\n\t\tbuff_step = 128;\n\telse\n\t\t/* Don't enforce steps on buffer sizes, still need to\n\t\t   be multiple of 4 bytes (HDA spec). Tested on Intel\n\t\t   HDA controllers, may not work on all devices where\n\t\t   option needs to be disabled */\n\t\tbuff_step = 4;\n\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,\n\t\t\t\t   buff_step);\n\tsnd_hda_power_up(apcm->codec);\n\tif (hinfo->ops.open)\n\t\terr = hinfo->ops.open(hinfo, apcm->codec, substream);\n\telse\n\t\terr = -ENODEV;\n\tif (err < 0) {\n\t\tazx_release_device(azx_dev);\n\t\tgoto powerdown;\n\t}\n\tsnd_pcm_limit_hw_rates(runtime);\n\t/* sanity check */\n\tif (snd_BUG_ON(!runtime->hw.channels_min) ||\n\t    snd_BUG_ON(!runtime->hw.channels_max) ||\n\t    snd_BUG_ON(!runtime->hw.formats) ||\n\t    snd_BUG_ON(!runtime->hw.rates)) {\n\t\tazx_release_device(azx_dev);\n\t\tif (hinfo->ops.close)\n\t\t\thinfo->ops.close(hinfo, apcm->codec, substream);\n\t\terr = -EINVAL;\n\t\tgoto powerdown;\n\t}\n\n\t/* disable LINK_ATIME timestamps for capture streams\n\t   until we figure out how to handle digital inputs */\n\tif (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_WALL_CLOCK; /* legacy */\n\t\truntime->hw.info &= ~SNDRV_PCM_INFO_HAS_LINK_ATIME;\n\t}\n\n\tsnd_pcm_set_sync(substream);\n\tmutex_unlock(&chip->open_mutex);\n\treturn 0;\n\n powerdown:\n\tsnd_hda_power_down(apcm->codec);\n unlock:\n\tmutex_unlock(&chip->open_mutex);\n\tsnd_hda_codec_pcm_put(apcm->info);\n\treturn err;\n}\n```\n\n## Local supplementary source\n\n### macro 'snd_pcm_substream_chip' \u2014 'include/sound/pcm.h':21-21 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (referenced by changed code: snd_pcm_substream_chip)\n\n```c\n#define snd_pcm_substream_chip(substream) ((substream)->private_data)\n```\n\n### macro 'snd_pcm_substream_chip' \u2014 'include/sound/pcm.h':21-21 @ c9e6e5f38bf75276605f1952b22285f5f3abcaff (referenced by changed code: snd_pcm_substream_chip)\n\n```c\n#define snd_pcm_substream_chip(substream) ((substream)->private_data)\n```\n\n### function 'to_hda_pcm_stream' \u2014 'sound/hda/common/controller.c':60-65 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (referenced by changed code: to_hda_pcm_stream)\n\n```c\nstatic inline struct hda_pcm_stream *\nto_hda_pcm_stream(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\treturn &apcm->info->stream[substream->stream];\n}\n```\n\n### function 'to_hda_pcm_stream' \u2014 'sound/hda/common/controller.c':60-65 @ c9e6e5f38bf75276605f1952b22285f5f3abcaff (referenced by changed code: to_hda_pcm_stream)\n\n```c\nstatic inline struct hda_pcm_stream *\nto_hda_pcm_stream(struct snd_pcm_substream *substream)\n{\n\tstruct azx_pcm *apcm = snd_pcm_substream_chip(substream);\n\treturn &apcm->info->stream[substream->stream];\n}\n```\n\n### function 'snd_hda_codec_pcm_get' \u2014 'include/sound/hda_codec.h':440-443 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (referenced by changed code: snd_hda_codec_pcm_get)\n\n```c\nstatic inline void snd_hda_codec_pcm_get(struct hda_pcm *pcm)\n{\n\tsnd_refcount_get(&pcm->codec->pcm_ref);\n}\n```\n\n### function 'snd_hda_codec_pcm_get' \u2014 'include/sound/hda_codec.h':440-443 @ c9e6e5f38bf75276605f1952b22285f5f3abcaff (referenced by changed code: snd_hda_codec_pcm_get)\n\n```c\nstatic inline void snd_hda_codec_pcm_get(struct hda_pcm *pcm)\n{\n\tsnd_refcount_get(&pcm->codec->pcm_ref);\n}\n```\n\n### function 'snd_refcount_get' \u2014 'include/sound/core.h':91-94 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (one-level callee of snd_hda_codec_pcm_get)\n\n```c\nstatic inline void snd_refcount_get(struct snd_refcount *ref)\n{\n\tatomic_inc(&ref->count);\n}\n```\n\n### function 'snd_refcount_get' \u2014 'include/sound/core.h':91-94 @ c9e6e5f38bf75276605f1952b22285f5f3abcaff (one-level callee of snd_hda_codec_pcm_get)\n\n```c\nstatic inline void snd_refcount_get(struct snd_refcount *ref)\n{\n\tatomic_inc(&ref->count);\n}\n```\n\n### function 'azx_assign_device' \u2014 'sound/hda/common/controller.c':43-52 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (referenced by changed code: azx_assign_device)\n\n```c\nstatic inline struct azx_dev *\nazx_assign_device(struct azx *chip, struct snd_pcm_substream *substream)\n{\n\tstruct hdac_stream *s;\n\n\ts = snd_hdac_stream_assign(azx_bus(chip), substream);\n\tif (!s)\n\t\treturn NULL;\n\treturn stream_to_azx_dev(s);\n}\n```\n\n### function 'azx_assign_device' \u2014 'sound/hda/common/controller.c':43-52 @ c9e6e5f38bf75276605f1952b22285f5f3abcaff (referenced by changed code: azx_assign_device)\n\n```c\nstatic inline struct azx_dev *\nazx_assign_device(struct azx *chip, struct snd_pcm_substream *substream)\n{\n\tstruct hdac_stream *s;\n\n\ts = snd_hdac_stream_assign(azx_bus(chip), substream);\n\tif (!s)\n\t\treturn NULL;\n\treturn stream_to_azx_dev(s);\n}\n```\n\n### macro 'azx_bus' \u2014 'sound/hda/common/hda_controller.h':152-152 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (one-level callee of azx_assign_device)\n\n```c\n#define azx_bus(chip)\t(&(chip)->bus.core)\n```\n\n### macro 'stream_to_azx_dev' \u2014 'sound/hda/common/hda_controller.h':69-69 @ 5ab3dc647751996784cff20a51f3730f4e88afe4 (one-level callee of azx_assign_device)\n\n```c\n#define stream_to_azx_dev(s)\tcontainer_of(s, struct azx_dev, core)\n```\n\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/tsc.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/div64.h'\n- include_unresolved: 'Cannot resolve asm/io.h'\n- include_unresolved: 'Cannot resolve asm/clocksource.h'\n- include_unresolved: 'Cannot resolve asm/delay.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/ptrace.h'\n- include_unresolved: 'Cannot resolve asm/irq.h'\n- include_unresolved: 'Cannot resolve asm/sections.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/byteorder.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/module.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve linux/param.h'\n- include_unresolved: 'Cannot resolve asm/timex.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/barrier.h'\n- include_unresolved: 'Cannot resolve asm/cache.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/byteorder.h'\n- include_unresolved: 'Cannot resolve asm/prom.h'\n- include_unresolved: 'Cannot resolve asm/vdso/clocksource.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n\n## Collection notes\n\n311 diagnostic(s). Full provenance, raw collected material, and diagnostics are in context.json.\n",
+  "schema_version": 1,
+  "include_supplements": true,
+  "complete": false
+}

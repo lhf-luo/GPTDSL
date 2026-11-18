@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "repository": "/home/lhf/linux",
+  "commit_file": "/home/lhf/GPTDSL/artifacts/patch_context/commits.txt",
+  "counts": {
+    "total": 3,
+    "succeeded": 3,
+    "failed": 0,
+    "duplicates": 0
+  },
+  "entries": [
+    {
+      "line": 1,
+      "input": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "commit": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "status": "ok",
+      "output": "c9e6e5f38bf75276605f1952b22285f5f3abcaff",
+      "complete": false,
+      "diagnostics": 311
+    },
+    {
+      "line": 2,
+      "input": "50fd0ada8d37587223001600933270b59cb30e19",
+      "commit": "50fd0ada8d37587223001600933270b59cb30e19",
+      "status": "ok",
+      "output": "50fd0ada8d37587223001600933270b59cb30e19",
+      "complete": false,
+      "diagnostics": 269
+    },
+    {
+      "line": 3,
+      "input": "8a1f3cf89ddcc700e25afe42cfad333059adcc94",
+      "commit": "8a1f3cf89ddcc700e25afe42cfad333059adcc94",
+      "status": "ok",
+      "output": "8a1f3cf89ddcc700e25afe42cfad333059adcc94",
+      "complete": false,
+      "diagnostics": 340
+    }
+  ]
+}
