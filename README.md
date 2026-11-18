@@ -32,6 +32,40 @@ uv run gptdsl context --repo D:/sources/linux --commit <commit-sha> --out artifa
 输出目录必须位于输入仓库之外。生成 `context.json` 与 `context.md`，已有同名文件默认拒绝覆盖，
 显式传入 `--overwrite` 可替换。`--max-context-chars 16000` 可调整 Markdown 字符预算（最低 512）。
 
+### 一个文件包含多个提交
+
+使用 `--commit-file` 传入 UTF-8 文本文件（支持 BOM），每行一个 hash 或提交引用。
+空行和 `#` 后的注释会被忽略；不接受 CSV 或每行多个 hash。
+
+```text
+# commits.txt：将下面占位值替换为实际提交 hash
+COMMIT_SHA_1
+COMMIT_SHA_2
+```
+
+```powershell
+uv run gptdsl context --repo D:/sources/linux --commit-file commits.txt --out artifacts/batch
+```
+
+`--commit` 与 `--commit-file` 二选一。批量模式顺序处理，每个提交输出到完整 SHA 命名的子目录：
+
+```text
+artifacts/batch/
+├── summary.json
+├── <完整 SHA 1>/
+│   ├── context.json
+│   └── context.md
+└── <完整 SHA 2>/
+    ├── context.json
+    └── context.md
+```
+
+长短 hash 或不同引用解析到同一提交时只处理一次，汇总记录重复项及首次出现的行号。
+单项失败后继续处理其余提交，`summary.json` 记录每行状态、完整 SHA、输出目录或错误原因。
+结果含诊断仍视为成功导出；任何条目失败时整个命令返回 2，否则返回 0。
+已有汇总文件默认在开始处理前拒绝覆盖；`--overwrite` 可替换汇总和本次提交的已有结果。
+重复项不会覆盖首次处理的结果，也不将首次失败自动重试。
+
 也可使用 Python 接口：
 
 ```python
@@ -46,7 +80,7 @@ materials = context.to_dict()
 ```
 
 接口只读 Git 对象，不切换版本、不更新索引、不读取当前工作区补齐历史材料，也不下载缺失提交。
-暂不支持根提交、合并提交、独立补丁文件或批量任务。
+暂不支持根提交、合并提交或独立补丁文件。Python 接口处理单个提交，CLI 支持文件批量输入。
 
 `context.json` 保存已收集的原始源码、前后函数、来源位置和诊断；`context.md` 是有预算的展示版本。
 超限文件、无法解析或无法唯一解析的符号会显式记录，不代表所有上下文均已收齐。
