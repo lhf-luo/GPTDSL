@@ -1,0 +1,2070 @@
+{
+  "repository": "/home/lhf/linux",
+  "commit": "50fd0ada8d37587223001600933270b59cb30e19",
+  "parent_commit": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+  "message": "gpio: virtuser: skip free_irq when no IRQ is installed\n\nDisabling interrupt monitoring uses atomic_xchg() to clear the stored IRQ.\nWhen monitoring is already disabled, atomic_xchg() returns 0. It must not\nbe passed to free_irq().\n\nThe bug is reproducible on an x86_64 QEMU guest with\nCONFIG_GPIO_VIRTUSER=y and CONFIG_GPIO_SIM=y. Configure a live\ngpio-virtuser device through configfs. Its input lookup must refer to a\nlive gpio-sim bank, such as key gpio-sim-test with offset 0. The\nconsumer's dev_name attribute is shown as <dev> below; then run:\n\n    echo 0 > /sys/kernel/debug/gpio-virtuser/<dev>/gpiod:input:0/interrupts\n\nOn an unpatched kernel, this reaches gpio_virtuser_interrupts_set() with\nld->irq still at its initial value 0, and free_irq() reports:\n\n    Trying to free already-free IRQ 0\n\nThe same reproducer completes without the warning on the patched kernel.\n\nFixes: 91581c4b3f29 (\"gpio: virtuser: new virtual testing driver for the GPIO API\")\nAssisted-by: LLM\nSigned-off-by: Runyu Xiao <runyu.xiao@seu.edu.cn>\nReviewed-by: Linus Walleij <linusw@kernel.org>\nLink: https://patch.msgid.link/20260914051537.15320-1-runyu.xiao@seu.edu.cn\nSigned-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>",
+  "diff": "diff --git a/drivers/gpio/gpio-virtuser.c b/drivers/gpio/gpio-virtuser.c\nindex 7d0d366be37a..d5876c19cfef 100644\n--- a/drivers/gpio/gpio-virtuser.c\n+++ b/drivers/gpio/gpio-virtuser.c\n@@ -675,41 +675,42 @@ static int gpio_virtuser_interrupts_set(void *data, u64 val)\n \tif (val > 1)\n \t\treturn -EINVAL;\n \n \tif (val) {\n \t\tirq = gpiod_to_irq(ld->ad.desc);\n \t\tif (irq < 0)\n \t\t\treturn irq;\n \n \t\tret = request_threaded_irq(irq, NULL,\n \t\t\t\t\t   gpio_virtuser_irq_handler,\n \t\t\t\t\t   IRQF_TRIGGER_RISING |\n \t\t\t\t\t   IRQF_TRIGGER_FALLING |\n \t\t\t\t\t   IRQF_ONESHOT,\n \t\t\t\t\t   ld->consumer, data);\n \t\tif (ret)\n \t\t\treturn ret;\n \n \t\tatomic_set(&ld->irq, irq);\n \t} else {\n \t\tirq = atomic_xchg(&ld->irq, 0);\n-\t\tfree_irq(irq, ld);\n+\t\tif (irq)\n+\t\t\tfree_irq(irq, ld);\n \t}\n \n \treturn 0;\n }\n \n DEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_interrupts_fops,\n \t\t\t gpio_virtuser_interrupts_get,\n \t\t\t gpio_virtuser_interrupts_set,\n \t\t\t \"%llu\\n\");\n \n static const struct gpio_virtuser_dbgfs_attr_descr\n gpio_virtuser_line_array_dbgfs_attrs[] = {\n \t{\n \t\t.name = \"values\",\n \t\t.fops = &gpio_virtuser_value_array_fops,\n \t},\n \t{\n \t\t.name = \"values_atomic\",\n \t\t.fops = &gpio_virtuser_value_array_atomic_fops,\n \t},\n",
+  "files": [
+    {
+      "status": "M",
+      "before_path": "drivers/gpio/gpio-virtuser.c",
+      "after_path": "drivers/gpio/gpio-virtuser.c",
+      "before_text": "// SPDX-License-Identifier: GPL-2.0-only\n/*\n * Configurable virtual GPIO consumer module.\n *\n * Copyright (C) 2023-2024 Bartosz Golaszewski <bartosz.golaszewski@linaro.org>\n */\n\n#define pr_fmt(fmt) KBUILD_MODNAME \": \" fmt\n\n#include <linux/array_size.h>\n#include <linux/atomic.h>\n#include <linux/bitmap.h>\n#include <linux/cleanup.h>\n#include <linux/configfs.h>\n#include <linux/debugfs.h>\n#include <linux/device.h>\n#include <linux/err.h>\n#include <linux/gpio/consumer.h>\n#include <linux/gpio/machine.h>\n#include <linux/idr.h>\n#include <linux/interrupt.h>\n#include <linux/irq_work.h>\n#include <linux/limits.h>\n#include <linux/list.h>\n#include <linux/lockdep.h>\n#include <linux/module.h>\n#include <linux/mutex.h>\n#include <linux/notifier.h>\n#include <linux/of.h>\n#include <linux/overflow.h>\n#include <linux/platform_device.h>\n#include <linux/printk.h>\n#include <linux/property.h>\n#include <linux/slab.h>\n#include <linux/string_helpers.h>\n#include <linux/types.h>\n\n#define GPIO_VIRTUSER_NAME_BUF_LEN 32\n\nstatic DEFINE_IDA(gpio_virtuser_ida);\nstatic struct dentry *gpio_virtuser_dbg_root;\n\nstruct gpio_virtuser_attr_data {\n\tunion {\n\t\tstruct gpio_desc *desc;\n\t\tstruct gpio_descs *descs;\n\t};\n\tstruct dentry *dbgfs_dir;\n};\n\nstruct gpio_virtuser_line_array_data {\n\tstruct gpio_virtuser_attr_data ad;\n};\n\nstruct gpio_virtuser_line_data {\n\tstruct gpio_virtuser_attr_data ad;\n\tchar consumer[GPIO_VIRTUSER_NAME_BUF_LEN];\n\tstruct mutex consumer_lock;\n\tunsigned int debounce;\n\tatomic_t irq;\n\tatomic_t irq_count;\n};\n\nstruct gpio_virtuser_dbgfs_attr_descr {\n\tconst char *name;\n\tconst struct file_operations *fops;\n};\n\nstruct gpio_virtuser_irq_work_context {\n\tstruct irq_work work;\n\tstruct completion work_completion;\n\tunion {\n\t\tstruct {\n\t\t\tstruct gpio_desc *desc;\n\t\t\tint dir;\n\t\t\tint val;\n\t\t\tint ret;\n\t\t};\n\t\tstruct {\n\t\t\tstruct gpio_descs *descs;\n\t\t\tunsigned long *values;\n\t\t};\n\t};\n};\n\nstatic struct gpio_virtuser_irq_work_context *\nto_gpio_virtuser_irq_work_context(struct irq_work *work)\n{\n\treturn container_of(work, struct gpio_virtuser_irq_work_context, work);\n}\n\nstatic void\ngpio_virtuser_init_irq_work_context(struct gpio_virtuser_irq_work_context *ctx)\n{\n\tmemset(ctx, 0, sizeof(*ctx));\n\tinit_completion(&ctx->work_completion);\n}\n\nstatic void\ngpio_virtuser_irq_work_queue_sync(struct gpio_virtuser_irq_work_context *ctx)\n{\n\tirq_work_queue(&ctx->work);\n\twait_for_completion(&ctx->work_completion);\n}\n\nstatic void gpio_virtuser_dbgfs_emit_value_array(char *buf,\n\t\t\t\t\t\t unsigned long *values,\n\t\t\t\t\t\t size_t num_values)\n{\n\tsize_t i;\n\n\tfor (i = 0; i < num_values; i++)\n\t\tbuf[i] = test_bit(i, values) ? '1' : '0';\n\n\tbuf[i++] = '\\n';\n}\n\nstatic void gpio_virtuser_get_value_array_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\tstruct gpio_descs *descs = ctx->descs;\n\n\tctx->ret = gpiod_get_array_value(descs->ndescs, descs->desc,\n\t\t\t\t\t descs->info, ctx->values);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_get_array_value(struct gpio_descs *descs,\n\t\t\t\t\t unsigned long *values, bool atomic)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tif (!atomic)\n\t\treturn gpiod_get_array_value_cansleep(descs->ndescs,\n\t\t\t\t\t\t      descs->desc,\n\t\t\t\t\t\t      descs->info, values);\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_get_value_array_atomic);\n\tctx.descs = descs;\n\tctx.values = values;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_value_array_do_read(struct file *file,\n\t\t\t\t\t\t char __user *user_buf,\n\t\t\t\t\t\t size_t size, loff_t *ppos,\n\t\t\t\t\t\t bool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_descs *descs = data->ad.descs;\n\tsize_t bufsize;\n\tint ret;\n\n\tunsigned long *values __free(bitmap) = bitmap_zalloc(descs->ndescs,\n\t\t\t\t\t\t\t     GFP_KERNEL);\n\tif (!values)\n\t\treturn -ENOMEM;\n\n\tret = gpio_virtuser_get_array_value(descs, values, atomic);\n\tif (ret)\n\t\treturn ret;\n\n\tbufsize = descs->ndescs + 2;\n\n\tchar *buf __free(kfree) = kzalloc(bufsize, GFP_KERNEL);\n\tif (!buf)\n\t\treturn -ENOMEM;\n\n\tgpio_virtuser_dbgfs_emit_value_array(buf, values, descs->ndescs);\n\n\treturn simple_read_from_buffer(user_buf, size, ppos, buf,\n\t\t\t\t       descs->ndescs + 1);\n}\n\nstatic int gpio_virtuser_dbgfs_parse_value_array(const char *buf,\n\t\t\t\t\t\t size_t len,\n\t\t\t\t\t\t unsigned long *values)\n{\n\tsize_t i;\n\n\tfor (i = 0; i < len; i++) {\n\t\tif (buf[i] == '0')\n\t\t\tclear_bit(i, values);\n\t\telse if (buf[i] == '1')\n\t\t\tset_bit(i, values);\n\t\telse\n\t\t\treturn -EINVAL;\n\t}\n\n\treturn 0;\n}\n\nstatic void gpio_virtuser_set_value_array_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\tstruct gpio_descs *descs = ctx->descs;\n\n\tctx->ret = gpiod_set_array_value(descs->ndescs, descs->desc,\n\t\t\t\t\t descs->info, ctx->values);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_set_array_value(struct gpio_descs *descs,\n\t\t\t\t\t unsigned long *values, bool atomic)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tif (!atomic)\n\t\treturn gpiod_multi_set_value_cansleep(descs, values);\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_set_value_array_atomic);\n\tctx.descs = descs;\n\tctx.values = values;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_value_array_do_write(struct file *file,\n\t\t\t\t\t\t  const char __user *user_buf,\n\t\t\t\t\t\t  size_t count, loff_t *ppos,\n\t\t\t\t\t\t  bool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_descs *descs = data->ad.descs;\n\tint ret;\n\n\tif (count - 1 != descs->ndescs)\n\t\treturn -EINVAL;\n\n\tchar *buf __free(kfree) = kzalloc(count, GFP_KERNEL);\n\tif (!buf)\n\t\treturn -ENOMEM;\n\n\tret = simple_write_to_buffer(buf, count, ppos, user_buf, count);\n\tif (ret < 0)\n\t\treturn ret;\n\n\tunsigned long *values __free(bitmap) = bitmap_zalloc(descs->ndescs,\n\t\t\t\t\t\t\t     GFP_KERNEL);\n\tif (!values)\n\t\treturn -ENOMEM;\n\n\tret = gpio_virtuser_dbgfs_parse_value_array(buf, count - 1, values);\n\tif (ret)\n\t\treturn ret;\n\n\tret = gpio_virtuser_set_array_value(descs, values, atomic);\n\tif (ret)\n\t\treturn ret;\n\n\treturn count;\n}\n\nstatic ssize_t gpio_virtuser_value_array_read(struct file *file,\n\t\t\t\t\t      char __user *user_buf,\n\t\t\t\t\t      size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_read(file, user_buf, count, ppos,\n\t\t\t\t\t\t false);\n}\n\nstatic ssize_t gpio_virtuser_value_array_write(struct file *file,\n\t\t\t\t\t       const char __user *user_buf,\n\t\t\t\t\t       size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\t  false);\n}\n\nstatic const struct file_operations gpio_virtuser_value_array_fops = {\n\t.read = gpio_virtuser_value_array_read,\n\t.write = gpio_virtuser_value_array_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic ssize_t\ngpio_virtuser_value_array_atomic_read(struct file *file, char __user *user_buf,\n\t\t\t\t      size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_read(file, user_buf, count, ppos,\n\t\t\t\t\t\t true);\n}\n\nstatic ssize_t\ngpio_virtuser_value_array_atomic_write(struct file *file,\n\t\t\t\t       const char __user *user_buf,\n\t\t\t\t       size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\t  true);\n}\n\nstatic const struct file_operations gpio_virtuser_value_array_atomic_fops = {\n\t.read = gpio_virtuser_value_array_atomic_read,\n\t.write = gpio_virtuser_value_array_atomic_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic void gpio_virtuser_do_get_direction_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->ret = gpiod_get_direction(ctx->desc);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_get_direction_atomic(struct gpio_desc *desc)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_do_get_direction_atomic);\n\tctx.desc = desc;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_direction_do_read(struct file *file,\n\t\t\t\t\t       char __user *user_buf,\n\t\t\t\t\t       size_t size, loff_t *ppos,\n\t\t\t\t\t       bool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_desc *desc = data->ad.desc;\n\tchar buf[32];\n\tint dir;\n\n\tif (!atomic)\n\t\tdir = gpiod_get_direction(desc);\n\telse\n\t\tdir = gpio_virtuser_get_direction_atomic(desc);\n\tif (dir < 0)\n\t\treturn dir;\n\n\tsnprintf(buf, sizeof(buf), \"%s\\n\", dir ? \"input\" : \"output\");\n\n\treturn simple_read_from_buffer(user_buf, size, ppos, buf, strlen(buf));\n}\n\nstatic int gpio_virtuser_set_direction(struct gpio_desc *desc, int dir, int val)\n{\n\tif (dir)\n\t\treturn gpiod_direction_input(desc);\n\n\treturn gpiod_direction_output(desc, val);\n}\n\nstatic void gpio_virtuser_do_set_direction_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->ret = gpio_virtuser_set_direction(ctx->desc, ctx->dir, ctx->val);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_set_direction_atomic(struct gpio_desc *desc,\n\t\t\t\t\t      int dir, int val)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_do_set_direction_atomic);\n\tctx.desc = desc;\n\tctx.dir = dir;\n\tctx.val = val;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_direction_do_write(struct file *file,\n\t\t\t\t\t\tconst char __user *user_buf,\n\t\t\t\t\t\tsize_t count, loff_t *ppos,\n\t\t\t\t\t\tbool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_desc *desc = data->ad.desc;\n\tchar buf[32], *trimmed;\n\tint ret, dir, val = 0;\n\n\tif (*ppos != 0 || count >= sizeof(buf))\n\t\treturn -EINVAL;\n\n\tret = simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);\n\tif (ret < 0)\n\t\treturn ret;\n\n\tbuf[ret] = '\\0';\n\n\ttrimmed = strim(buf);\n\n\tif (strcmp(trimmed, \"input\") == 0) {\n\t\tdir = 1;\n\t} else if (strcmp(trimmed, \"output-high\") == 0) {\n\t\tdir = 0;\n\t\tval = 1;\n\t} else if (strcmp(trimmed, \"output-low\") == 0) {\n\t\tdir = val = 0;\n\t} else {\n\t\treturn -EINVAL;\n\t}\n\n\tif (!atomic)\n\t\tret = gpio_virtuser_set_direction(desc, dir, val);\n\telse\n\t\tret = gpio_virtuser_set_direction_atomic(desc, dir, val);\n\tif (ret)\n\t\treturn ret;\n\n\treturn count;\n}\n\nstatic ssize_t gpio_virtuser_direction_read(struct file *file,\n\t\t\t\t\t    char __user *user_buf,\n\t\t\t\t\t    size_t size, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_read(file, user_buf, size, ppos,\n\t\t\t\t\t       false);\n}\n\nstatic ssize_t gpio_virtuser_direction_write(struct file *file,\n\t\t\t\t\t     const char __user *user_buf,\n\t\t\t\t\t     size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\tfalse);\n}\n\nstatic const struct file_operations gpio_virtuser_direction_fops = {\n\t.read = gpio_virtuser_direction_read,\n\t.write = gpio_virtuser_direction_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic ssize_t gpio_virtuser_direction_atomic_read(struct file *file,\n\t\t\t\t\t\t   char __user *user_buf,\n\t\t\t\t\t\t   size_t size, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_read(file, user_buf, size, ppos,\n\t\t\t\t\t       true);\n}\n\nstatic ssize_t gpio_virtuser_direction_atomic_write(struct file *file,\n\t\t\t\t\t\t    const char __user *user_buf,\n\t\t\t\t\t\t    size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\ttrue);\n}\n\nstatic const struct file_operations gpio_virtuser_direction_atomic_fops = {\n\t.read = gpio_virtuser_direction_atomic_read,\n\t.write = gpio_virtuser_direction_atomic_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic int gpio_virtuser_value_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint ret;\n\n\tret = gpiod_get_value_cansleep(ld->ad.desc);\n\tif (ret < 0)\n\t\treturn ret;\n\n\t*val = ret;\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_value_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\treturn gpiod_set_value_cansleep(ld->ad.desc, (int)val);\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_value_fops,\n\t\t\t gpio_virtuser_value_get,\n\t\t\t gpio_virtuser_value_set,\n\t\t\t \"%llu\\n\");\n\nstatic void gpio_virtuser_get_value_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->val = gpiod_get_value(ctx->desc);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_value_atomic_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_get_value_atomic);\n\tctx.desc = ld->ad.desc;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\tif (ctx.val < 0)\n\t\treturn ctx.val;\n\n\t*val = ctx.val;\n\n\treturn 0;\n}\n\nstatic void gpio_virtuser_set_value_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->ret = gpiod_set_value(ctx->desc, ctx->val);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_value_atomic_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_set_value_atomic);\n\tctx.desc = ld->ad.desc;\n\tctx.val = (int)val;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_value_atomic_fops,\n\t\t\t gpio_virtuser_value_atomic_get,\n\t\t\t gpio_virtuser_value_atomic_set,\n\t\t\t \"%llu\\n\");\n\nstatic int gpio_virtuser_debounce_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\t*val = READ_ONCE(ld->debounce);\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_debounce_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint ret;\n\n\tif (val > UINT_MAX)\n\t\treturn -E2BIG;\n\n\tret = gpiod_set_debounce(ld->ad.desc, (unsigned int)val);\n\tif (ret)\n\t\t/* Don't propagate errno unknown to user-space. */\n\t\treturn ret == -ENOTSUPP ? -EOPNOTSUPP : ret;\n\n\tWRITE_ONCE(ld->debounce, (unsigned int)val);\n\n\treturn 0;\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_debounce_fops,\n\t\t\t gpio_virtuser_debounce_get,\n\t\t\t gpio_virtuser_debounce_set,\n\t\t\t \"%llu\\n\");\n\nstatic ssize_t gpio_virtuser_consumer_read(struct file *file,\n\t\t\t\t\t   char __user *user_buf,\n\t\t\t\t\t   size_t size, loff_t *ppos)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tchar buf[GPIO_VIRTUSER_NAME_BUF_LEN + 1];\n\tssize_t ret;\n\n\tmemset(buf, 0x0, sizeof(buf));\n\n\tscoped_guard(mutex, &data->consumer_lock)\n\t\tret = snprintf(buf, sizeof(buf), \"%s\\n\", data->consumer);\n\n\treturn simple_read_from_buffer(user_buf, size, ppos, buf, ret);\n}\n\nstatic ssize_t gpio_virtuser_consumer_write(struct file *file,\n\t\t\t\t\t    const char __user *user_buf,\n\t\t\t\t\t    size_t count, loff_t *ppos)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tchar buf[GPIO_VIRTUSER_NAME_BUF_LEN + 2];\n\tint ret;\n\n\tif (*ppos != 0 || count >= sizeof(buf))\n\t\treturn -EINVAL;\n\n\tret = simple_write_to_buffer(buf, GPIO_VIRTUSER_NAME_BUF_LEN, ppos,\n\t\t\t\t     user_buf, count);\n\tif (ret < 0)\n\t\treturn ret;\n\n\tbuf[ret] = '\\0';\n\n\tret = gpiod_set_consumer_name(data->ad.desc, buf);\n\tif (ret)\n\t\treturn ret;\n\n\tscoped_guard(mutex, &data->consumer_lock)\n\t\tstrscpy(data->consumer, buf, sizeof(data->consumer));\n\n\treturn count;\n}\n\nstatic const struct file_operations gpio_virtuser_consumer_fops = {\n\t.read = gpio_virtuser_consumer_read,\n\t.write = gpio_virtuser_consumer_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic int gpio_virtuser_interrupts_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\t*val = atomic_read(&ld->irq_count);\n\n\treturn 0;\n}\n\nstatic irqreturn_t gpio_virtuser_irq_handler(int irq, void *data)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\tatomic_inc(&ld->irq_count);\n\n\treturn IRQ_HANDLED;\n}\n\nstatic int gpio_virtuser_interrupts_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint irq, ret;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tif (val) {\n\t\tirq = gpiod_to_irq(ld->ad.desc);\n\t\tif (irq < 0)\n\t\t\treturn irq;\n\n\t\tret = request_threaded_irq(irq, NULL,\n\t\t\t\t\t   gpio_virtuser_irq_handler,\n\t\t\t\t\t   IRQF_TRIGGER_RISING |\n\t\t\t\t\t   IRQF_TRIGGER_FALLING |\n\t\t\t\t\t   IRQF_ONESHOT,\n\t\t\t\t\t   ld->consumer, data);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tatomic_set(&ld->irq, irq);\n\t} else {\n\t\tirq = atomic_xchg(&ld->irq, 0);\n\t\tfree_irq(irq, ld);\n\t}\n\n\treturn 0;\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_interrupts_fops,\n\t\t\t gpio_virtuser_interrupts_get,\n\t\t\t gpio_virtuser_interrupts_set,\n\t\t\t \"%llu\\n\");\n\nstatic const struct gpio_virtuser_dbgfs_attr_descr\ngpio_virtuser_line_array_dbgfs_attrs[] = {\n\t{\n\t\t.name = \"values\",\n\t\t.fops = &gpio_virtuser_value_array_fops,\n\t},\n\t{\n\t\t.name = \"values_atomic\",\n\t\t.fops = &gpio_virtuser_value_array_atomic_fops,\n\t},\n};\n\nstatic const struct gpio_virtuser_dbgfs_attr_descr\ngpio_virtuser_line_dbgfs_attrs[] = {\n\t{\n\t\t.name = \"direction\",\n\t\t.fops = &gpio_virtuser_direction_fops,\n\t},\n\t{\n\t\t.name = \"direction_atomic\",\n\t\t.fops = &gpio_virtuser_direction_atomic_fops,\n\t},\n\t{\n\t\t.name = \"value\",\n\t\t.fops = &gpio_virtuser_value_fops,\n\t},\n\t{\n\t\t.name = \"value_atomic\",\n\t\t.fops = &gpio_virtuser_value_atomic_fops,\n\t},\n\t{\n\t\t.name = \"debounce\",\n\t\t.fops = &gpio_virtuser_debounce_fops,\n\t},\n\t{\n\t\t.name = \"consumer\",\n\t\t.fops = &gpio_virtuser_consumer_fops,\n\t},\n\t{\n\t\t.name = \"interrupts\",\n\t\t.fops = &gpio_virtuser_interrupts_fops,\n\t},\n};\n\nstatic int gpio_virtuser_create_debugfs_attrs(\n\t\t\tconst struct gpio_virtuser_dbgfs_attr_descr *attr,\n\t\t\tsize_t num_attrs, struct dentry *parent, void *data)\n{\n\tstruct dentry *ret;\n\tsize_t i;\n\n\tfor (i = 0; i < num_attrs; i++, attr++) {\n\t\tret = debugfs_create_file(attr->name, 0644, parent, data,\n\t\t\t\t\t  attr->fops);\n\t\tif (IS_ERR(ret))\n\t\t\treturn PTR_ERR(ret);\n\t}\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_dbgfs_init_line_array_attrs(struct device *dev,\n\t\t\t\t\t\t     struct gpio_descs *descs,\n\t\t\t\t\t\t     const char *id,\n\t\t\t\t\t\t     struct dentry *dbgfs_entry)\n{\n\tstruct gpio_virtuser_line_array_data *data;\n\tchar *name;\n\n\tdata = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);\n\tif (!data)\n\t\treturn -ENOMEM;\n\n\tdata->ad.descs = descs;\n\n\tname = devm_kasprintf(dev, GFP_KERNEL, \"gpiod:%s\", id);\n\tif (!name)\n\t\treturn -ENOMEM;\n\n\tdata->ad.dbgfs_dir = debugfs_create_dir(name, dbgfs_entry);\n\tif (IS_ERR(data->ad.dbgfs_dir))\n\t\treturn PTR_ERR(data->ad.dbgfs_dir);\n\n\treturn gpio_virtuser_create_debugfs_attrs(\n\t\t\tgpio_virtuser_line_array_dbgfs_attrs,\n\t\t\tARRAY_SIZE(gpio_virtuser_line_array_dbgfs_attrs),\n\t\t\tdata->ad.dbgfs_dir, data);\n}\n\nstatic int gpio_virtuser_dbgfs_init_line_attrs(struct device *dev,\n\t\t\t\t\t       struct gpio_desc *desc,\n\t\t\t\t\t       const char *id,\n\t\t\t\t\t       unsigned int index,\n\t\t\t\t\t       struct dentry *dbgfs_entry)\n{\n\tstruct gpio_virtuser_line_data *data;\n\tchar *name;\n\tint ret;\n\n\tdata = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);\n\tif (!data)\n\t\treturn -ENOMEM;\n\n\tdata->ad.desc = desc;\n\tstrscpy(data->consumer, id);\n\tatomic_set(&data->irq, 0);\n\tatomic_set(&data->irq_count, 0);\n\n\tname = devm_kasprintf(dev, GFP_KERNEL, \"gpiod:%s:%u\", id, index);\n\tif (!name)\n\t\treturn -ENOMEM;\n\n\tret = devm_mutex_init(dev, &data->consumer_lock);\n\tif (ret)\n\t\treturn ret;\n\n\tdata->ad.dbgfs_dir = debugfs_create_dir(name, dbgfs_entry);\n\tif (IS_ERR(data->ad.dbgfs_dir))\n\t\treturn PTR_ERR(data->ad.dbgfs_dir);\n\n\treturn gpio_virtuser_create_debugfs_attrs(\n\t\t\t\tgpio_virtuser_line_dbgfs_attrs,\n\t\t\t\tARRAY_SIZE(gpio_virtuser_line_dbgfs_attrs),\n\t\t\t\tdata->ad.dbgfs_dir, data);\n}\n\nstatic void gpio_virtuser_debugfs_remove(void *data)\n{\n\tstruct dentry *dbgfs_entry = data;\n\n\tdebugfs_remove_recursive(dbgfs_entry);\n}\n\nstatic int gpio_virtuser_prop_is_gpio(struct property *prop)\n{\n\tchar *dash = strrchr(prop->name, '-');\n\n\treturn dash && strcmp(dash, \"-gpios\") == 0;\n}\n\n/*\n * If this is an OF-based system, then we iterate over properties and consider\n * all whose names end in \"-gpios\". For configfs we expect an additional string\n * array property - \"gpio-virtuser,ids\" - containing the list of all GPIO IDs\n * to request.\n */\nstatic int gpio_virtuser_count_ids(struct device *dev)\n{\n\tstruct device_node *of_node = dev_of_node(dev);\n\tstruct property *prop;\n\tint ret = 0;\n\n\tif (!of_node)\n\t\treturn device_property_string_array_count(dev,\n\t\t\t\t\t\t\t  \"gpio-virtuser,ids\");\n\n\tfor_each_property_of_node(of_node, prop) {\n\t\tif (gpio_virtuser_prop_is_gpio(prop))\n\t\t\t++ret;\n\t}\n\n\treturn ret;\n}\n\nstatic int gpio_virtuser_get_ids(struct device *dev, const char **ids,\n\t\t\t\t int num_ids)\n{\n\tstruct device_node *of_node = dev_of_node(dev);\n\tstruct property *prop;\n\tsize_t pos = 0, diff;\n\tchar *dash, *tmp;\n\n\tif (!of_node)\n\t\treturn device_property_read_string_array(dev,\n\t\t\t\t\t\t\t \"gpio-virtuser,ids\",\n\t\t\t\t\t\t\t ids, num_ids);\n\n\tfor_each_property_of_node(of_node, prop) {\n\t\tif (!gpio_virtuser_prop_is_gpio(prop))\n\t\t\tcontinue;\n\n\t\tdash = strrchr(prop->name, '-');\n\t\tdiff = dash - prop->name;\n\n\t\ttmp = devm_kmemdup(dev, prop->name, diff + 1,\n\t\t\t\t   GFP_KERNEL);\n\t\tif (!tmp)\n\t\t\treturn -ENOMEM;\n\n\t\ttmp[diff] = '\\0';\n\t\tids[pos++] = tmp;\n\t}\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_probe(struct platform_device *pdev)\n{\n\tstruct device *dev = &pdev->dev;\n\tstruct dentry *dbgfs_entry;\n\tstruct gpio_descs *descs;\n\tint ret, num_ids = 0, i;\n\tconst char **ids;\n\tunsigned int j;\n\n\tnum_ids = gpio_virtuser_count_ids(dev);\n\tif (num_ids < 0)\n\t\treturn dev_err_probe(dev, num_ids,\n\t\t\t\t     \"Failed to get the number of GPIOs to request\\n\");\n\n\tif (num_ids == 0)\n\t\treturn dev_err_probe(dev, -EINVAL, \"No GPIO IDs specified\\n\");\n\n\tids = devm_kcalloc(dev, num_ids, sizeof(*ids), GFP_KERNEL);\n\tif (!ids)\n\t\treturn -ENOMEM;\n\n\tret = gpio_virtuser_get_ids(dev, ids, num_ids);\n\tif (ret < 0)\n\t\treturn dev_err_probe(dev, ret,\n\t\t\t\t     \"Failed to get the IDs of GPIOs to request\\n\");\n\n\tdbgfs_entry = debugfs_create_dir(dev_name(dev), gpio_virtuser_dbg_root);\n\tret = devm_add_action_or_reset(dev, gpio_virtuser_debugfs_remove,\n\t\t\t\t       dbgfs_entry);\n\tif (ret)\n\t\treturn ret;\n\n\tfor (i = 0; i < num_ids; i++) {\n\t\tdescs = devm_gpiod_get_array(dev, ids[i], GPIOD_ASIS);\n\t\tif (IS_ERR(descs))\n\t\t\treturn dev_err_probe(dev, PTR_ERR(descs),\n\t\t\t\t\t     \"Failed to request the '%s' GPIOs\\n\",\n\t\t\t\t\t     ids[i]);\n\n\t\tret = gpio_virtuser_dbgfs_init_line_array_attrs(dev, descs,\n\t\t\t\t\t\t\t\tids[i],\n\t\t\t\t\t\t\t\tdbgfs_entry);\n\t\tif (ret)\n\t\t\treturn dev_err_probe(dev, ret,\n\t\t\t\t\t     \"Failed to setup the debugfs array interface for the '%s' GPIOs\\n\",\n\t\t\t\t\t     ids[i]);\n\n\t\tfor (j = 0; j < descs->ndescs; j++) {\n\t\t\tret = gpio_virtuser_dbgfs_init_line_attrs(dev,\n\t\t\t\t\t\t\tdescs->desc[j], ids[i],\n\t\t\t\t\t\t\tj, dbgfs_entry);\n\t\t\tif (ret)\n\t\t\t\treturn dev_err_probe(dev, ret,\n\t\t\t\t\t\t     \"Failed to setup the debugfs line interface for the '%s' GPIOs\\n\",\n\t\t\t\t\t\t     ids[i]);\n\t\t}\n\t}\n\n\treturn 0;\n}\n\nstatic const struct of_device_id gpio_virtuser_of_match[] = {\n\t{ .compatible = \"gpio-virtuser\" },\n\t{ }\n};\nMODULE_DEVICE_TABLE(of, gpio_virtuser_of_match);\n\nstatic struct platform_driver gpio_virtuser_driver = {\n\t.driver = {\n\t\t.name = \"gpio-virtuser\",\n\t\t.of_match_table = gpio_virtuser_of_match,\n\t},\n\t.probe = gpio_virtuser_probe,\n};\n\nstruct gpio_virtuser_device {\n\tstruct platform_device *pdev;\n\tstruct config_group group;\n\n\tint id;\n\tstruct mutex lock;\n\n\tstruct gpiod_lookup_table *lookup_table;\n\n\tstruct list_head lookup_list;\n};\n\nstatic struct gpio_virtuser_device *\nto_gpio_virtuser_device(struct config_item *item)\n{\n\tstruct config_group *group = to_config_group(item);\n\n\treturn container_of(group, struct gpio_virtuser_device, group);\n}\n\nstatic bool\ngpio_virtuser_device_is_live(struct gpio_virtuser_device *dev)\n{\n\tlockdep_assert_held(&dev->lock);\n\n\treturn !!dev->pdev;\n}\n\nstruct gpio_virtuser_lookup {\n\tstruct config_group group;\n\n\tstruct gpio_virtuser_device *parent;\n\tstruct list_head siblings;\n\n\tchar *con_id;\n\n\tstruct list_head entry_list;\n};\n\nstatic struct gpio_virtuser_lookup *\nto_gpio_virtuser_lookup(struct config_item *item)\n{\n\tstruct config_group *group = to_config_group(item);\n\n\treturn container_of(group, struct gpio_virtuser_lookup, group);\n}\n\nstruct gpio_virtuser_lookup_entry {\n\tstruct config_group group;\n\n\tstruct gpio_virtuser_lookup *parent;\n\tstruct list_head siblings;\n\n\tchar *key;\n\t/* Can be negative to indicate lookup by name. */\n\tint offset;\n\tenum gpio_lookup_flags flags;\n};\n\nstatic struct gpio_virtuser_lookup_entry *\nto_gpio_virtuser_lookup_entry(struct config_item *item)\n{\n\tstruct config_group *group = to_config_group(item);\n\n\treturn container_of(group, struct gpio_virtuser_lookup_entry, group);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_key_show(struct config_item *item, char *page)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\treturn sprintf(page, \"%s\\n\", entry->key ?: \"\");\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_key_store(struct config_item *item,\n\t\t\t\t\t    const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tchar *key __free(kfree) = kstrndup(skip_spaces(page), count,\n\t\t\t\t\t   GFP_KERNEL);\n\tif (!key)\n\t\treturn -ENOMEM;\n\n\tstrim(key);\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tkfree(entry->key);\n\tentry->key = no_free_ptr(key);\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, key);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_offset_show(struct config_item *item,\n\t\t\t\t\t      char *page)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tunsigned int offset;\n\n\tscoped_guard(mutex, &dev->lock)\n\t\toffset = entry->offset;\n\n\treturn sprintf(page, \"%d\\n\", offset);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_offset_store(struct config_item *item,\n\t\t\t\t\t       const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tint offset, ret;\n\n\tret = kstrtoint(page, 0, &offset);\n\tif (ret)\n\t\treturn ret;\n\n\t/*\n\t * Negative number here means: 'key' represents a line name to lookup.\n\t * Non-negative means: 'key' represents the label of the chip with\n\t * the 'offset' value representing the line within that chip.\n\t *\n\t * GPIOLIB uses the U16_MAX value to indicate lookup by line name so\n\t * the greatest offset we can accept is (U16_MAX - 1).\n\t */\n\tif (offset > (U16_MAX - 1))\n\t\treturn -EINVAL;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tentry->offset = offset;\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, offset);\n\nstatic enum gpio_lookup_flags\ngpio_virtuser_lookup_get_flags(struct config_item *item)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\treturn entry->flags;\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_drive_show(struct config_item *item, char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\tconst char *repr;\n\n\tif (flags & GPIO_OPEN_DRAIN)\n\t\trepr = \"open-drain\";\n\telse if (flags & GPIO_OPEN_SOURCE)\n\t\trepr = \"open-source\";\n\telse\n\t\trepr = \"push-pull\";\n\n\treturn sprintf(page, \"%s\\n\", repr);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_drive_store(struct config_item *item,\n\t\t\t\t\t      const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (sysfs_streq(page, \"push-pull\")) {\n\t\tentry->flags &= ~(GPIO_OPEN_DRAIN | GPIO_OPEN_SOURCE);\n\t} else if (sysfs_streq(page, \"open-drain\")) {\n\t\tentry->flags &= ~GPIO_OPEN_SOURCE;\n\t\tentry->flags |= GPIO_OPEN_DRAIN;\n\t} else if (sysfs_streq(page, \"open-source\")) {\n\t\tentry->flags &= ~GPIO_OPEN_DRAIN;\n\t\tentry->flags |= GPIO_OPEN_SOURCE;\n\t} else {\n\t\tcount = -EINVAL;\n\t}\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, drive);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_pull_show(struct config_item *item, char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\tconst char *repr;\n\n\tif (flags & GPIO_PULL_UP)\n\t\trepr = \"pull-up\";\n\telse if (flags & GPIO_PULL_DOWN)\n\t\trepr = \"pull-down\";\n\telse if (flags & GPIO_PULL_DISABLE)\n\t\trepr = \"pull-disabled\";\n\telse\n\t\trepr = \"as-is\";\n\n\treturn sprintf(page, \"%s\\n\", repr);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_pull_store(struct config_item *item,\n\t\t\t\t\t     const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (sysfs_streq(page, \"pull-up\")) {\n\t\tentry->flags &= ~(GPIO_PULL_DOWN | GPIO_PULL_DISABLE);\n\t\tentry->flags |= GPIO_PULL_UP;\n\t} else if (sysfs_streq(page, \"pull-down\")) {\n\t\tentry->flags &= ~(GPIO_PULL_UP | GPIO_PULL_DISABLE);\n\t\tentry->flags |= GPIO_PULL_DOWN;\n\t} else if (sysfs_streq(page, \"pull-disabled\")) {\n\t\tentry->flags &= ~(GPIO_PULL_UP | GPIO_PULL_DOWN);\n\t\tentry->flags |= GPIO_PULL_DISABLE;\n\t} else if (sysfs_streq(page, \"as-is\")) {\n\t\tentry->flags &= ~(GPIO_PULL_UP | GPIO_PULL_DOWN |\n\t\t\t\t  GPIO_PULL_DISABLE);\n\t} else {\n\t\tcount = -EINVAL;\n\t}\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, pull);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_active_low_show(struct config_item *item,\n\t\t\t\t\t\t  char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\n\treturn sprintf(page, \"%c\\n\", flags & GPIO_ACTIVE_LOW ? '1' : '0');\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_active_low_store(struct config_item *item,\n\t\t\t\t\t\t   const char *page,\n\t\t\t\t\t\t   size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tbool active_low;\n\tint ret;\n\n\tret = kstrtobool(page, &active_low);\n\tif (ret)\n\t\treturn ret;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (active_low)\n\t\tentry->flags |= GPIO_ACTIVE_LOW;\n\telse\n\t\tentry->flags &= ~GPIO_ACTIVE_LOW;\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, active_low);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_transitory_show(struct config_item *item,\n\t\t\t\t\t\t  char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\n\treturn sprintf(page, \"%c\\n\", flags & GPIO_TRANSITORY ? '1' : '0');\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_transitory_store(struct config_item *item,\n\t\t\t\t\t\t   const char *page,\n\t\t\t\t\t\t   size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tbool transitory;\n\tint ret;\n\n\tret = kstrtobool(page, &transitory);\n\tif (ret)\n\t\treturn ret;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (transitory)\n\t\tentry->flags |= GPIO_TRANSITORY;\n\telse\n\t\tentry->flags &= ~GPIO_TRANSITORY;\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, transitory);\n\nstatic struct configfs_attribute *gpio_virtuser_lookup_entry_config_attrs[] = {\n\t&gpio_virtuser_lookup_entry_config_attr_key,\n\t&gpio_virtuser_lookup_entry_config_attr_offset,\n\t&gpio_virtuser_lookup_entry_config_attr_drive,\n\t&gpio_virtuser_lookup_entry_config_attr_pull,\n\t&gpio_virtuser_lookup_entry_config_attr_active_low,\n\t&gpio_virtuser_lookup_entry_config_attr_transitory,\n\tNULL\n};\n\nstatic ssize_t\ngpio_virtuser_device_config_dev_name_show(struct config_item *item,\n\t\t\t\t\t  char *page)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\tstruct platform_device *pdev;\n\n\tguard(mutex)(&dev->lock);\n\n\tpdev = dev->pdev;\n\tif (pdev)\n\t\treturn sprintf(page, \"%s\\n\", dev_name(&pdev->dev));\n\n\treturn sprintf(page, \"gpio-sim.%d\\n\", dev->id);\n}\n\nCONFIGFS_ATTR_RO(gpio_virtuser_device_config_, dev_name);\n\nstatic ssize_t gpio_virtuser_device_config_live_show(struct config_item *item,\n\t\t\t\t\t\t     char *page)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\tbool live;\n\n\tscoped_guard(mutex, &dev->lock)\n\t\tlive = gpio_virtuser_device_is_live(dev);\n\n\treturn sprintf(page, \"%c\\n\", live ? '1' : '0');\n}\n\nstatic size_t\ngpio_virtuser_get_lookup_count(struct gpio_virtuser_device *dev)\n{\n\tstruct gpio_virtuser_lookup *lookup;\n\tsize_t count = 0;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings)\n\t\tcount += list_count_nodes(&lookup->entry_list);\n\n\treturn count;\n}\n\nstatic int\ngpio_virtuser_make_lookup_table(struct gpio_virtuser_device *dev)\n{\n\tsize_t num_entries = gpio_virtuser_get_lookup_count(dev);\n\tstruct gpio_virtuser_lookup_entry *entry;\n\tstruct gpio_virtuser_lookup *lookup;\n\tunsigned int i = 0, idx;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tstruct gpiod_lookup_table *table __free(kfree) =\n\t\tkzalloc_flex(*table, table, num_entries + 1);\n\tif (!table)\n\t\treturn -ENOMEM;\n\n\ttable->dev_id = kasprintf(GFP_KERNEL, \"gpio-virtuser.%d\", dev->id);\n\tif (!table->dev_id)\n\t\treturn -ENOMEM;\n\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings) {\n\t\tidx = 0;\n\t\tlist_for_each_entry(entry, &lookup->entry_list, siblings) {\n\t\t\ttable->table[i++] =\n\t\t\t\tGPIO_LOOKUP_IDX(entry->key,\n\t\t\t\t\t\tentry->offset < 0 ? U16_MAX : entry->offset,\n\t\t\t\t\t\tlookup->con_id, idx++, entry->flags);\n\t\t}\n\t}\n\n\tgpiod_add_lookup_table(table);\n\tdev->lookup_table = no_free_ptr(table);\n\n\treturn 0;\n}\n\nstatic void\ngpio_virtuser_remove_lookup_table(struct gpio_virtuser_device *dev)\n{\n\tgpiod_remove_lookup_table(dev->lookup_table);\n\tkfree(dev->lookup_table->dev_id);\n\tkfree(dev->lookup_table);\n\tdev->lookup_table = NULL;\n}\n\nstatic struct fwnode_handle *\ngpio_virtuser_make_device_swnode(struct gpio_virtuser_device *dev)\n{\n\tstruct property_entry properties[2];\n\tstruct gpio_virtuser_lookup *lookup;\n\tunsigned int i = 0;\n\tsize_t num_ids;\n\n\tmemset(properties, 0, sizeof(properties));\n\n\tnum_ids = list_count_nodes(&dev->lookup_list);\n\tchar **ids __free(kfree) = kcalloc(num_ids + 1, sizeof(*ids),\n\t\t\t\t\t   GFP_KERNEL);\n\tif (!ids)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings)\n\t\tids[i++] = lookup->con_id;\n\n\tproperties[0] = PROPERTY_ENTRY_STRING_ARRAY_LEN(\"gpio-virtuser,ids\",\n\t\t\t\t\t\t\tids, num_ids);\n\n\treturn fwnode_create_software_node(properties, NULL);\n}\n\nstatic int\ngpio_virtuser_device_activate(struct gpio_virtuser_device *dev)\n{\n\tstruct platform_device_info pdevinfo;\n\tstruct platform_device *pdev;\n\tstruct fwnode_handle *swnode;\n\tint ret;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tif (list_empty(&dev->lookup_list))\n\t\treturn -ENODATA;\n\n\tswnode = gpio_virtuser_make_device_swnode(dev);\n\tif (IS_ERR(swnode))\n\t\treturn PTR_ERR(swnode);\n\n\tmemset(&pdevinfo, 0, sizeof(pdevinfo));\n\tpdevinfo.name = \"gpio-virtuser\";\n\tpdevinfo.id = dev->id;\n\tpdevinfo.fwnode = swnode;\n\n\tret = gpio_virtuser_make_lookup_table(dev);\n\tif (ret)\n\t\tgoto err_remove_swnode;\n\n\tpdev = platform_device_register_full(&pdevinfo);\n\tif (IS_ERR(pdev)) {\n\t\tret = PTR_ERR(pdev);\n\t\tgoto err_remove_lookup_table;\n\t}\n\n\twait_for_device_probe();\n\n\tscoped_guard(device, &pdev->dev) {\n\t\tif (!device_is_bound(&pdev->dev)) {\n\t\t\tret = -ENXIO;\n\t\t\tgoto err_unregister_pdev;\n\t\t}\n\t}\n\n\tdev->pdev = pdev;\n\treturn 0;\n\nerr_unregister_pdev:\n\tplatform_device_unregister(pdev);\nerr_remove_lookup_table:\n\tgpio_virtuser_remove_lookup_table(dev);\nerr_remove_swnode:\n\tfwnode_remove_software_node(swnode);\n\n\treturn ret;\n}\n\nstatic void\ngpio_virtuser_device_deactivate(struct gpio_virtuser_device *dev)\n{\n\tstruct fwnode_handle *swnode;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tswnode = dev_fwnode(&dev->pdev->dev);\n\tplatform_device_unregister(dev->pdev);\n\tdev->pdev = NULL;\n\tgpio_virtuser_remove_lookup_table(dev);\n\tfwnode_remove_software_node(swnode);\n}\n\nstatic void\ngpio_virtuser_device_lockup_configfs(struct gpio_virtuser_device *dev, bool lock)\n{\n\tstruct configfs_subsystem *subsys = dev->group.cg_subsys;\n\tstruct gpio_virtuser_lookup_entry *entry;\n\tstruct gpio_virtuser_lookup *lookup;\n\n\t/*\n\t * The device only needs to depend on leaf lookup entries. This is\n\t * sufficient to lock up all the configfs entries that the\n\t * instantiated, alive device depends on.\n\t */\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings) {\n\t\tlist_for_each_entry(entry, &lookup->entry_list, siblings) {\n\t\t\tif (lock)\n\t\t\t\tWARN_ON(configfs_depend_item_unlocked(\n\t\t\t\t\t\tsubsys, &entry->group.cg_item));\n\t\t\telse\n\t\t\t\tconfigfs_undepend_item_unlocked(\n\t\t\t\t\t\t&entry->group.cg_item);\n\t\t}\n\t}\n}\n\nstatic ssize_t\ngpio_virtuser_device_config_live_store(struct config_item *item,\n\t\t\t\t       const char *page, size_t count)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\tint ret = 0;\n\tbool live;\n\n\tret = kstrtobool(page, &live);\n\tif (ret)\n\t\treturn ret;\n\n\tif (live)\n\t\tgpio_virtuser_device_lockup_configfs(dev, true);\n\n\tscoped_guard(mutex, &dev->lock) {\n\t\tif (live == gpio_virtuser_device_is_live(dev))\n\t\t\tret = -EPERM;\n\t\telse if (live)\n\t\t\tret = gpio_virtuser_device_activate(dev);\n\t\telse\n\t\t\tgpio_virtuser_device_deactivate(dev);\n\t}\n\n\t/*\n\t * Undepend is required only if device disablement (live == 0)\n\t * succeeds or if device enablement (live == 1) fails.\n\t */\n\tif (live == !!ret)\n\t\tgpio_virtuser_device_lockup_configfs(dev, false);\n\n\treturn ret ?: count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_device_config_, live);\n\nstatic struct configfs_attribute *gpio_virtuser_device_config_attrs[] = {\n\t&gpio_virtuser_device_config_attr_dev_name,\n\t&gpio_virtuser_device_config_attr_live,\n\tNULL\n};\n\nstatic void\ngpio_virtuser_lookup_entry_config_group_release(struct config_item *item)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tlist_del(&entry->siblings);\n\n\tkfree(entry->key);\n\tkfree(entry);\n}\n\nstatic struct\nconfigfs_item_operations gpio_virtuser_lookup_entry_config_item_ops = {\n\t.release\t= gpio_virtuser_lookup_entry_config_group_release,\n};\n\nstatic const struct\nconfig_item_type gpio_virtuser_lookup_entry_config_group_type = {\n\t.ct_item_ops\t= &gpio_virtuser_lookup_entry_config_item_ops,\n\t.ct_attrs\t= gpio_virtuser_lookup_entry_config_attrs,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct config_group *\ngpio_virtuser_make_lookup_entry_group(struct config_group *group,\n\t\t\t\t      const char *name)\n{\n\tstruct gpio_virtuser_lookup *lookup =\n\t\t\t\tto_gpio_virtuser_lookup(&group->cg_item);\n\tstruct gpio_virtuser_device *dev = lookup->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn ERR_PTR(-EBUSY);\n\n\tstruct gpio_virtuser_lookup_entry *entry __free(kfree) =\n\t\t\t\tkzalloc_obj(*entry);\n\tif (!entry)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tconfig_group_init_type_name(&entry->group, name,\n\t\t\t&gpio_virtuser_lookup_entry_config_group_type);\n\tentry->flags = GPIO_LOOKUP_FLAGS_DEFAULT;\n\tentry->parent = lookup;\n\tlist_add_tail(&entry->siblings, &lookup->entry_list);\n\n\treturn &no_free_ptr(entry)->group;\n}\n\nstatic void gpio_virtuser_lookup_config_group_release(struct config_item *item)\n{\n\tstruct gpio_virtuser_lookup *lookup = to_gpio_virtuser_lookup(item);\n\tstruct gpio_virtuser_device *dev = lookup->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tlist_del(&lookup->siblings);\n\n\tkfree(lookup->con_id);\n\tkfree(lookup);\n}\n\nstatic const struct configfs_item_operations gpio_virtuser_lookup_config_item_ops = {\n\t.release\t= gpio_virtuser_lookup_config_group_release,\n};\n\nstatic struct\nconfigfs_group_operations gpio_virtuser_lookup_config_group_ops = {\n\t.make_group     = gpio_virtuser_make_lookup_entry_group,\n};\n\nstatic const struct config_item_type gpio_virtuser_lookup_config_group_type = {\n\t.ct_group_ops\t= &gpio_virtuser_lookup_config_group_ops,\n\t.ct_item_ops\t= &gpio_virtuser_lookup_config_item_ops,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct config_group *\ngpio_virtuser_make_lookup_group(struct config_group *group, const char *name)\n{\n\tstruct gpio_virtuser_device *dev =\n\t\t\t\tto_gpio_virtuser_device(&group->cg_item);\n\n\tif (strlen(name) > (GPIO_VIRTUSER_NAME_BUF_LEN - 1))\n\t\treturn ERR_PTR(-E2BIG);\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn ERR_PTR(-EBUSY);\n\n\tstruct gpio_virtuser_lookup *lookup __free(kfree) =\n\t\t\t\tkzalloc_obj(*lookup);\n\tif (!lookup)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tlookup->con_id = kstrdup(name, GFP_KERNEL);\n\tif (!lookup->con_id)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tconfig_group_init_type_name(&lookup->group, name,\n\t\t\t\t    &gpio_virtuser_lookup_config_group_type);\n\tINIT_LIST_HEAD(&lookup->entry_list);\n\tlookup->parent = dev;\n\tlist_add_tail(&lookup->siblings, &dev->lookup_list);\n\n\treturn &no_free_ptr(lookup)->group;\n}\n\nstatic void gpio_virtuser_device_config_group_release(struct config_item *item)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\n\tscoped_guard(mutex, &dev->lock) {\n\t\tif (gpio_virtuser_device_is_live(dev))\n\t\t\tgpio_virtuser_device_deactivate(dev);\n\t}\n\n\tmutex_destroy(&dev->lock);\n\tida_free(&gpio_virtuser_ida, dev->id);\n\tkfree(dev);\n}\n\nstatic const struct configfs_item_operations gpio_virtuser_device_config_item_ops = {\n\t.release\t= gpio_virtuser_device_config_group_release,\n};\n\nstatic const struct configfs_group_operations gpio_virtuser_device_config_group_ops = {\n\t.make_group\t= gpio_virtuser_make_lookup_group,\n};\n\nstatic const struct config_item_type gpio_virtuser_device_config_group_type = {\n\t.ct_group_ops\t= &gpio_virtuser_device_config_group_ops,\n\t.ct_item_ops\t= &gpio_virtuser_device_config_item_ops,\n\t.ct_attrs\t= gpio_virtuser_device_config_attrs,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct config_group *\ngpio_virtuser_config_make_device_group(struct config_group *group,\n\t\t\t\t       const char *name)\n{\n\tstruct gpio_virtuser_device *dev __free(kfree) = kzalloc_obj(*dev);\n\tif (!dev)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tdev->id = ida_alloc(&gpio_virtuser_ida, GFP_KERNEL);\n\tif (dev->id < 0)\n\t\treturn ERR_PTR(dev->id);\n\n\tconfig_group_init_type_name(&dev->group, name,\n\t\t\t\t    &gpio_virtuser_device_config_group_type);\n\tmutex_init(&dev->lock);\n\tINIT_LIST_HEAD(&dev->lookup_list);\n\n\treturn &no_free_ptr(dev)->group;\n}\n\nstatic const struct configfs_group_operations gpio_virtuser_config_group_ops = {\n\t.make_group\t= gpio_virtuser_config_make_device_group,\n};\n\nstatic const struct config_item_type gpio_virtuser_config_type = {\n\t.ct_group_ops\t= &gpio_virtuser_config_group_ops,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct configfs_subsystem gpio_virtuser_config_subsys = {\n\t.su_group = {\n\t\t.cg_item = {\n\t\t\t.ci_namebuf\t= \"gpio-virtuser\",\n\t\t\t.ci_type\t= &gpio_virtuser_config_type,\n\t\t},\n\t},\n};\n\nstatic int __init gpio_virtuser_init(void)\n{\n\tint ret;\n\n\tret = platform_driver_register(&gpio_virtuser_driver);\n\tif (ret) {\n\t\tpr_err(\"Failed to register the platform driver: %d\\n\", ret);\n\t\treturn ret;\n\t}\n\n\tconfig_group_init(&gpio_virtuser_config_subsys.su_group);\n\tmutex_init(&gpio_virtuser_config_subsys.su_mutex);\n\tret = configfs_register_subsystem(&gpio_virtuser_config_subsys);\n\tif (ret) {\n\t\tpr_err(\"Failed to register the '%s' configfs subsystem: %d\\n\",\n\t\t       gpio_virtuser_config_subsys.su_group.cg_item.ci_namebuf,\n\t\t       ret);\n\t\tgoto err_plat_drv_unreg;\n\t}\n\n\tgpio_virtuser_dbg_root = debugfs_create_dir(\"gpio-virtuser\", NULL);\n\tif (IS_ERR(gpio_virtuser_dbg_root)) {\n\t\tret = PTR_ERR(gpio_virtuser_dbg_root);\n\t\tpr_err(\"Failed to create the debugfs tree: %d\\n\", ret);\n\t\tgoto err_configfs_unreg;\n\t}\n\n\treturn 0;\n\nerr_configfs_unreg:\n\tconfigfs_unregister_subsystem(&gpio_virtuser_config_subsys);\nerr_plat_drv_unreg:\n\tmutex_destroy(&gpio_virtuser_config_subsys.su_mutex);\n\tplatform_driver_unregister(&gpio_virtuser_driver);\n\n\treturn ret;\n}\nmodule_init(gpio_virtuser_init);\n\nstatic void __exit gpio_virtuser_exit(void)\n{\n\tconfigfs_unregister_subsystem(&gpio_virtuser_config_subsys);\n\tmutex_destroy(&gpio_virtuser_config_subsys.su_mutex);\n\tplatform_driver_unregister(&gpio_virtuser_driver);\n\tdebugfs_remove_recursive(gpio_virtuser_dbg_root);\n}\nmodule_exit(gpio_virtuser_exit);\n\nMODULE_AUTHOR(\"Bartosz Golaszewski <bartosz.golaszewski@linaro.org>\");\nMODULE_DESCRIPTION(\"Virtual GPIO consumer module\");\nMODULE_LICENSE(\"GPL\");\n",
+      "after_text": "// SPDX-License-Identifier: GPL-2.0-only\n/*\n * Configurable virtual GPIO consumer module.\n *\n * Copyright (C) 2023-2024 Bartosz Golaszewski <bartosz.golaszewski@linaro.org>\n */\n\n#define pr_fmt(fmt) KBUILD_MODNAME \": \" fmt\n\n#include <linux/array_size.h>\n#include <linux/atomic.h>\n#include <linux/bitmap.h>\n#include <linux/cleanup.h>\n#include <linux/configfs.h>\n#include <linux/debugfs.h>\n#include <linux/device.h>\n#include <linux/err.h>\n#include <linux/gpio/consumer.h>\n#include <linux/gpio/machine.h>\n#include <linux/idr.h>\n#include <linux/interrupt.h>\n#include <linux/irq_work.h>\n#include <linux/limits.h>\n#include <linux/list.h>\n#include <linux/lockdep.h>\n#include <linux/module.h>\n#include <linux/mutex.h>\n#include <linux/notifier.h>\n#include <linux/of.h>\n#include <linux/overflow.h>\n#include <linux/platform_device.h>\n#include <linux/printk.h>\n#include <linux/property.h>\n#include <linux/slab.h>\n#include <linux/string_helpers.h>\n#include <linux/types.h>\n\n#define GPIO_VIRTUSER_NAME_BUF_LEN 32\n\nstatic DEFINE_IDA(gpio_virtuser_ida);\nstatic struct dentry *gpio_virtuser_dbg_root;\n\nstruct gpio_virtuser_attr_data {\n\tunion {\n\t\tstruct gpio_desc *desc;\n\t\tstruct gpio_descs *descs;\n\t};\n\tstruct dentry *dbgfs_dir;\n};\n\nstruct gpio_virtuser_line_array_data {\n\tstruct gpio_virtuser_attr_data ad;\n};\n\nstruct gpio_virtuser_line_data {\n\tstruct gpio_virtuser_attr_data ad;\n\tchar consumer[GPIO_VIRTUSER_NAME_BUF_LEN];\n\tstruct mutex consumer_lock;\n\tunsigned int debounce;\n\tatomic_t irq;\n\tatomic_t irq_count;\n};\n\nstruct gpio_virtuser_dbgfs_attr_descr {\n\tconst char *name;\n\tconst struct file_operations *fops;\n};\n\nstruct gpio_virtuser_irq_work_context {\n\tstruct irq_work work;\n\tstruct completion work_completion;\n\tunion {\n\t\tstruct {\n\t\t\tstruct gpio_desc *desc;\n\t\t\tint dir;\n\t\t\tint val;\n\t\t\tint ret;\n\t\t};\n\t\tstruct {\n\t\t\tstruct gpio_descs *descs;\n\t\t\tunsigned long *values;\n\t\t};\n\t};\n};\n\nstatic struct gpio_virtuser_irq_work_context *\nto_gpio_virtuser_irq_work_context(struct irq_work *work)\n{\n\treturn container_of(work, struct gpio_virtuser_irq_work_context, work);\n}\n\nstatic void\ngpio_virtuser_init_irq_work_context(struct gpio_virtuser_irq_work_context *ctx)\n{\n\tmemset(ctx, 0, sizeof(*ctx));\n\tinit_completion(&ctx->work_completion);\n}\n\nstatic void\ngpio_virtuser_irq_work_queue_sync(struct gpio_virtuser_irq_work_context *ctx)\n{\n\tirq_work_queue(&ctx->work);\n\twait_for_completion(&ctx->work_completion);\n}\n\nstatic void gpio_virtuser_dbgfs_emit_value_array(char *buf,\n\t\t\t\t\t\t unsigned long *values,\n\t\t\t\t\t\t size_t num_values)\n{\n\tsize_t i;\n\n\tfor (i = 0; i < num_values; i++)\n\t\tbuf[i] = test_bit(i, values) ? '1' : '0';\n\n\tbuf[i++] = '\\n';\n}\n\nstatic void gpio_virtuser_get_value_array_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\tstruct gpio_descs *descs = ctx->descs;\n\n\tctx->ret = gpiod_get_array_value(descs->ndescs, descs->desc,\n\t\t\t\t\t descs->info, ctx->values);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_get_array_value(struct gpio_descs *descs,\n\t\t\t\t\t unsigned long *values, bool atomic)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tif (!atomic)\n\t\treturn gpiod_get_array_value_cansleep(descs->ndescs,\n\t\t\t\t\t\t      descs->desc,\n\t\t\t\t\t\t      descs->info, values);\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_get_value_array_atomic);\n\tctx.descs = descs;\n\tctx.values = values;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_value_array_do_read(struct file *file,\n\t\t\t\t\t\t char __user *user_buf,\n\t\t\t\t\t\t size_t size, loff_t *ppos,\n\t\t\t\t\t\t bool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_descs *descs = data->ad.descs;\n\tsize_t bufsize;\n\tint ret;\n\n\tunsigned long *values __free(bitmap) = bitmap_zalloc(descs->ndescs,\n\t\t\t\t\t\t\t     GFP_KERNEL);\n\tif (!values)\n\t\treturn -ENOMEM;\n\n\tret = gpio_virtuser_get_array_value(descs, values, atomic);\n\tif (ret)\n\t\treturn ret;\n\n\tbufsize = descs->ndescs + 2;\n\n\tchar *buf __free(kfree) = kzalloc(bufsize, GFP_KERNEL);\n\tif (!buf)\n\t\treturn -ENOMEM;\n\n\tgpio_virtuser_dbgfs_emit_value_array(buf, values, descs->ndescs);\n\n\treturn simple_read_from_buffer(user_buf, size, ppos, buf,\n\t\t\t\t       descs->ndescs + 1);\n}\n\nstatic int gpio_virtuser_dbgfs_parse_value_array(const char *buf,\n\t\t\t\t\t\t size_t len,\n\t\t\t\t\t\t unsigned long *values)\n{\n\tsize_t i;\n\n\tfor (i = 0; i < len; i++) {\n\t\tif (buf[i] == '0')\n\t\t\tclear_bit(i, values);\n\t\telse if (buf[i] == '1')\n\t\t\tset_bit(i, values);\n\t\telse\n\t\t\treturn -EINVAL;\n\t}\n\n\treturn 0;\n}\n\nstatic void gpio_virtuser_set_value_array_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\tstruct gpio_descs *descs = ctx->descs;\n\n\tctx->ret = gpiod_set_array_value(descs->ndescs, descs->desc,\n\t\t\t\t\t descs->info, ctx->values);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_set_array_value(struct gpio_descs *descs,\n\t\t\t\t\t unsigned long *values, bool atomic)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tif (!atomic)\n\t\treturn gpiod_multi_set_value_cansleep(descs, values);\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_set_value_array_atomic);\n\tctx.descs = descs;\n\tctx.values = values;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_value_array_do_write(struct file *file,\n\t\t\t\t\t\t  const char __user *user_buf,\n\t\t\t\t\t\t  size_t count, loff_t *ppos,\n\t\t\t\t\t\t  bool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_descs *descs = data->ad.descs;\n\tint ret;\n\n\tif (count - 1 != descs->ndescs)\n\t\treturn -EINVAL;\n\n\tchar *buf __free(kfree) = kzalloc(count, GFP_KERNEL);\n\tif (!buf)\n\t\treturn -ENOMEM;\n\n\tret = simple_write_to_buffer(buf, count, ppos, user_buf, count);\n\tif (ret < 0)\n\t\treturn ret;\n\n\tunsigned long *values __free(bitmap) = bitmap_zalloc(descs->ndescs,\n\t\t\t\t\t\t\t     GFP_KERNEL);\n\tif (!values)\n\t\treturn -ENOMEM;\n\n\tret = gpio_virtuser_dbgfs_parse_value_array(buf, count - 1, values);\n\tif (ret)\n\t\treturn ret;\n\n\tret = gpio_virtuser_set_array_value(descs, values, atomic);\n\tif (ret)\n\t\treturn ret;\n\n\treturn count;\n}\n\nstatic ssize_t gpio_virtuser_value_array_read(struct file *file,\n\t\t\t\t\t      char __user *user_buf,\n\t\t\t\t\t      size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_read(file, user_buf, count, ppos,\n\t\t\t\t\t\t false);\n}\n\nstatic ssize_t gpio_virtuser_value_array_write(struct file *file,\n\t\t\t\t\t       const char __user *user_buf,\n\t\t\t\t\t       size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\t  false);\n}\n\nstatic const struct file_operations gpio_virtuser_value_array_fops = {\n\t.read = gpio_virtuser_value_array_read,\n\t.write = gpio_virtuser_value_array_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic ssize_t\ngpio_virtuser_value_array_atomic_read(struct file *file, char __user *user_buf,\n\t\t\t\t      size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_read(file, user_buf, count, ppos,\n\t\t\t\t\t\t true);\n}\n\nstatic ssize_t\ngpio_virtuser_value_array_atomic_write(struct file *file,\n\t\t\t\t       const char __user *user_buf,\n\t\t\t\t       size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_value_array_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\t  true);\n}\n\nstatic const struct file_operations gpio_virtuser_value_array_atomic_fops = {\n\t.read = gpio_virtuser_value_array_atomic_read,\n\t.write = gpio_virtuser_value_array_atomic_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic void gpio_virtuser_do_get_direction_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->ret = gpiod_get_direction(ctx->desc);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_get_direction_atomic(struct gpio_desc *desc)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_do_get_direction_atomic);\n\tctx.desc = desc;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_direction_do_read(struct file *file,\n\t\t\t\t\t       char __user *user_buf,\n\t\t\t\t\t       size_t size, loff_t *ppos,\n\t\t\t\t\t       bool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_desc *desc = data->ad.desc;\n\tchar buf[32];\n\tint dir;\n\n\tif (!atomic)\n\t\tdir = gpiod_get_direction(desc);\n\telse\n\t\tdir = gpio_virtuser_get_direction_atomic(desc);\n\tif (dir < 0)\n\t\treturn dir;\n\n\tsnprintf(buf, sizeof(buf), \"%s\\n\", dir ? \"input\" : \"output\");\n\n\treturn simple_read_from_buffer(user_buf, size, ppos, buf, strlen(buf));\n}\n\nstatic int gpio_virtuser_set_direction(struct gpio_desc *desc, int dir, int val)\n{\n\tif (dir)\n\t\treturn gpiod_direction_input(desc);\n\n\treturn gpiod_direction_output(desc, val);\n}\n\nstatic void gpio_virtuser_do_set_direction_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->ret = gpio_virtuser_set_direction(ctx->desc, ctx->dir, ctx->val);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_set_direction_atomic(struct gpio_desc *desc,\n\t\t\t\t\t      int dir, int val)\n{\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_do_set_direction_atomic);\n\tctx.desc = desc;\n\tctx.dir = dir;\n\tctx.val = val;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nstatic ssize_t gpio_virtuser_direction_do_write(struct file *file,\n\t\t\t\t\t\tconst char __user *user_buf,\n\t\t\t\t\t\tsize_t count, loff_t *ppos,\n\t\t\t\t\t\tbool atomic)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tstruct gpio_desc *desc = data->ad.desc;\n\tchar buf[32], *trimmed;\n\tint ret, dir, val = 0;\n\n\tif (*ppos != 0 || count >= sizeof(buf))\n\t\treturn -EINVAL;\n\n\tret = simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);\n\tif (ret < 0)\n\t\treturn ret;\n\n\tbuf[ret] = '\\0';\n\n\ttrimmed = strim(buf);\n\n\tif (strcmp(trimmed, \"input\") == 0) {\n\t\tdir = 1;\n\t} else if (strcmp(trimmed, \"output-high\") == 0) {\n\t\tdir = 0;\n\t\tval = 1;\n\t} else if (strcmp(trimmed, \"output-low\") == 0) {\n\t\tdir = val = 0;\n\t} else {\n\t\treturn -EINVAL;\n\t}\n\n\tif (!atomic)\n\t\tret = gpio_virtuser_set_direction(desc, dir, val);\n\telse\n\t\tret = gpio_virtuser_set_direction_atomic(desc, dir, val);\n\tif (ret)\n\t\treturn ret;\n\n\treturn count;\n}\n\nstatic ssize_t gpio_virtuser_direction_read(struct file *file,\n\t\t\t\t\t    char __user *user_buf,\n\t\t\t\t\t    size_t size, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_read(file, user_buf, size, ppos,\n\t\t\t\t\t       false);\n}\n\nstatic ssize_t gpio_virtuser_direction_write(struct file *file,\n\t\t\t\t\t     const char __user *user_buf,\n\t\t\t\t\t     size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\tfalse);\n}\n\nstatic const struct file_operations gpio_virtuser_direction_fops = {\n\t.read = gpio_virtuser_direction_read,\n\t.write = gpio_virtuser_direction_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic ssize_t gpio_virtuser_direction_atomic_read(struct file *file,\n\t\t\t\t\t\t   char __user *user_buf,\n\t\t\t\t\t\t   size_t size, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_read(file, user_buf, size, ppos,\n\t\t\t\t\t       true);\n}\n\nstatic ssize_t gpio_virtuser_direction_atomic_write(struct file *file,\n\t\t\t\t\t\t    const char __user *user_buf,\n\t\t\t\t\t\t    size_t count, loff_t *ppos)\n{\n\treturn gpio_virtuser_direction_do_write(file, user_buf, count, ppos,\n\t\t\t\t\t\ttrue);\n}\n\nstatic const struct file_operations gpio_virtuser_direction_atomic_fops = {\n\t.read = gpio_virtuser_direction_atomic_read,\n\t.write = gpio_virtuser_direction_atomic_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic int gpio_virtuser_value_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint ret;\n\n\tret = gpiod_get_value_cansleep(ld->ad.desc);\n\tif (ret < 0)\n\t\treturn ret;\n\n\t*val = ret;\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_value_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\treturn gpiod_set_value_cansleep(ld->ad.desc, (int)val);\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_value_fops,\n\t\t\t gpio_virtuser_value_get,\n\t\t\t gpio_virtuser_value_set,\n\t\t\t \"%llu\\n\");\n\nstatic void gpio_virtuser_get_value_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->val = gpiod_get_value(ctx->desc);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_value_atomic_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_get_value_atomic);\n\tctx.desc = ld->ad.desc;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\tif (ctx.val < 0)\n\t\treturn ctx.val;\n\n\t*val = ctx.val;\n\n\treturn 0;\n}\n\nstatic void gpio_virtuser_set_value_atomic(struct irq_work *work)\n{\n\tstruct gpio_virtuser_irq_work_context *ctx =\n\t\t\tto_gpio_virtuser_irq_work_context(work);\n\n\tctx->ret = gpiod_set_value(ctx->desc, ctx->val);\n\tcomplete(&ctx->work_completion);\n}\n\nstatic int gpio_virtuser_value_atomic_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tstruct gpio_virtuser_irq_work_context ctx;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tgpio_virtuser_init_irq_work_context(&ctx);\n\tctx.work = IRQ_WORK_INIT_HARD(gpio_virtuser_set_value_atomic);\n\tctx.desc = ld->ad.desc;\n\tctx.val = (int)val;\n\n\tgpio_virtuser_irq_work_queue_sync(&ctx);\n\n\treturn ctx.ret;\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_value_atomic_fops,\n\t\t\t gpio_virtuser_value_atomic_get,\n\t\t\t gpio_virtuser_value_atomic_set,\n\t\t\t \"%llu\\n\");\n\nstatic int gpio_virtuser_debounce_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\t*val = READ_ONCE(ld->debounce);\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_debounce_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint ret;\n\n\tif (val > UINT_MAX)\n\t\treturn -E2BIG;\n\n\tret = gpiod_set_debounce(ld->ad.desc, (unsigned int)val);\n\tif (ret)\n\t\t/* Don't propagate errno unknown to user-space. */\n\t\treturn ret == -ENOTSUPP ? -EOPNOTSUPP : ret;\n\n\tWRITE_ONCE(ld->debounce, (unsigned int)val);\n\n\treturn 0;\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_debounce_fops,\n\t\t\t gpio_virtuser_debounce_get,\n\t\t\t gpio_virtuser_debounce_set,\n\t\t\t \"%llu\\n\");\n\nstatic ssize_t gpio_virtuser_consumer_read(struct file *file,\n\t\t\t\t\t   char __user *user_buf,\n\t\t\t\t\t   size_t size, loff_t *ppos)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tchar buf[GPIO_VIRTUSER_NAME_BUF_LEN + 1];\n\tssize_t ret;\n\n\tmemset(buf, 0x0, sizeof(buf));\n\n\tscoped_guard(mutex, &data->consumer_lock)\n\t\tret = snprintf(buf, sizeof(buf), \"%s\\n\", data->consumer);\n\n\treturn simple_read_from_buffer(user_buf, size, ppos, buf, ret);\n}\n\nstatic ssize_t gpio_virtuser_consumer_write(struct file *file,\n\t\t\t\t\t    const char __user *user_buf,\n\t\t\t\t\t    size_t count, loff_t *ppos)\n{\n\tstruct gpio_virtuser_line_data *data = file->private_data;\n\tchar buf[GPIO_VIRTUSER_NAME_BUF_LEN + 2];\n\tint ret;\n\n\tif (*ppos != 0 || count >= sizeof(buf))\n\t\treturn -EINVAL;\n\n\tret = simple_write_to_buffer(buf, GPIO_VIRTUSER_NAME_BUF_LEN, ppos,\n\t\t\t\t     user_buf, count);\n\tif (ret < 0)\n\t\treturn ret;\n\n\tbuf[ret] = '\\0';\n\n\tret = gpiod_set_consumer_name(data->ad.desc, buf);\n\tif (ret)\n\t\treturn ret;\n\n\tscoped_guard(mutex, &data->consumer_lock)\n\t\tstrscpy(data->consumer, buf, sizeof(data->consumer));\n\n\treturn count;\n}\n\nstatic const struct file_operations gpio_virtuser_consumer_fops = {\n\t.read = gpio_virtuser_consumer_read,\n\t.write = gpio_virtuser_consumer_write,\n\t.open = simple_open,\n\t.owner = THIS_MODULE,\n\t.llseek = default_llseek,\n};\n\nstatic int gpio_virtuser_interrupts_get(void *data, u64 *val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\t*val = atomic_read(&ld->irq_count);\n\n\treturn 0;\n}\n\nstatic irqreturn_t gpio_virtuser_irq_handler(int irq, void *data)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\n\tatomic_inc(&ld->irq_count);\n\n\treturn IRQ_HANDLED;\n}\n\nstatic int gpio_virtuser_interrupts_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint irq, ret;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tif (val) {\n\t\tirq = gpiod_to_irq(ld->ad.desc);\n\t\tif (irq < 0)\n\t\t\treturn irq;\n\n\t\tret = request_threaded_irq(irq, NULL,\n\t\t\t\t\t   gpio_virtuser_irq_handler,\n\t\t\t\t\t   IRQF_TRIGGER_RISING |\n\t\t\t\t\t   IRQF_TRIGGER_FALLING |\n\t\t\t\t\t   IRQF_ONESHOT,\n\t\t\t\t\t   ld->consumer, data);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tatomic_set(&ld->irq, irq);\n\t} else {\n\t\tirq = atomic_xchg(&ld->irq, 0);\n\t\tif (irq)\n\t\t\tfree_irq(irq, ld);\n\t}\n\n\treturn 0;\n}\n\nDEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_interrupts_fops,\n\t\t\t gpio_virtuser_interrupts_get,\n\t\t\t gpio_virtuser_interrupts_set,\n\t\t\t \"%llu\\n\");\n\nstatic const struct gpio_virtuser_dbgfs_attr_descr\ngpio_virtuser_line_array_dbgfs_attrs[] = {\n\t{\n\t\t.name = \"values\",\n\t\t.fops = &gpio_virtuser_value_array_fops,\n\t},\n\t{\n\t\t.name = \"values_atomic\",\n\t\t.fops = &gpio_virtuser_value_array_atomic_fops,\n\t},\n};\n\nstatic const struct gpio_virtuser_dbgfs_attr_descr\ngpio_virtuser_line_dbgfs_attrs[] = {\n\t{\n\t\t.name = \"direction\",\n\t\t.fops = &gpio_virtuser_direction_fops,\n\t},\n\t{\n\t\t.name = \"direction_atomic\",\n\t\t.fops = &gpio_virtuser_direction_atomic_fops,\n\t},\n\t{\n\t\t.name = \"value\",\n\t\t.fops = &gpio_virtuser_value_fops,\n\t},\n\t{\n\t\t.name = \"value_atomic\",\n\t\t.fops = &gpio_virtuser_value_atomic_fops,\n\t},\n\t{\n\t\t.name = \"debounce\",\n\t\t.fops = &gpio_virtuser_debounce_fops,\n\t},\n\t{\n\t\t.name = \"consumer\",\n\t\t.fops = &gpio_virtuser_consumer_fops,\n\t},\n\t{\n\t\t.name = \"interrupts\",\n\t\t.fops = &gpio_virtuser_interrupts_fops,\n\t},\n};\n\nstatic int gpio_virtuser_create_debugfs_attrs(\n\t\t\tconst struct gpio_virtuser_dbgfs_attr_descr *attr,\n\t\t\tsize_t num_attrs, struct dentry *parent, void *data)\n{\n\tstruct dentry *ret;\n\tsize_t i;\n\n\tfor (i = 0; i < num_attrs; i++, attr++) {\n\t\tret = debugfs_create_file(attr->name, 0644, parent, data,\n\t\t\t\t\t  attr->fops);\n\t\tif (IS_ERR(ret))\n\t\t\treturn PTR_ERR(ret);\n\t}\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_dbgfs_init_line_array_attrs(struct device *dev,\n\t\t\t\t\t\t     struct gpio_descs *descs,\n\t\t\t\t\t\t     const char *id,\n\t\t\t\t\t\t     struct dentry *dbgfs_entry)\n{\n\tstruct gpio_virtuser_line_array_data *data;\n\tchar *name;\n\n\tdata = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);\n\tif (!data)\n\t\treturn -ENOMEM;\n\n\tdata->ad.descs = descs;\n\n\tname = devm_kasprintf(dev, GFP_KERNEL, \"gpiod:%s\", id);\n\tif (!name)\n\t\treturn -ENOMEM;\n\n\tdata->ad.dbgfs_dir = debugfs_create_dir(name, dbgfs_entry);\n\tif (IS_ERR(data->ad.dbgfs_dir))\n\t\treturn PTR_ERR(data->ad.dbgfs_dir);\n\n\treturn gpio_virtuser_create_debugfs_attrs(\n\t\t\tgpio_virtuser_line_array_dbgfs_attrs,\n\t\t\tARRAY_SIZE(gpio_virtuser_line_array_dbgfs_attrs),\n\t\t\tdata->ad.dbgfs_dir, data);\n}\n\nstatic int gpio_virtuser_dbgfs_init_line_attrs(struct device *dev,\n\t\t\t\t\t       struct gpio_desc *desc,\n\t\t\t\t\t       const char *id,\n\t\t\t\t\t       unsigned int index,\n\t\t\t\t\t       struct dentry *dbgfs_entry)\n{\n\tstruct gpio_virtuser_line_data *data;\n\tchar *name;\n\tint ret;\n\n\tdata = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);\n\tif (!data)\n\t\treturn -ENOMEM;\n\n\tdata->ad.desc = desc;\n\tstrscpy(data->consumer, id);\n\tatomic_set(&data->irq, 0);\n\tatomic_set(&data->irq_count, 0);\n\n\tname = devm_kasprintf(dev, GFP_KERNEL, \"gpiod:%s:%u\", id, index);\n\tif (!name)\n\t\treturn -ENOMEM;\n\n\tret = devm_mutex_init(dev, &data->consumer_lock);\n\tif (ret)\n\t\treturn ret;\n\n\tdata->ad.dbgfs_dir = debugfs_create_dir(name, dbgfs_entry);\n\tif (IS_ERR(data->ad.dbgfs_dir))\n\t\treturn PTR_ERR(data->ad.dbgfs_dir);\n\n\treturn gpio_virtuser_create_debugfs_attrs(\n\t\t\t\tgpio_virtuser_line_dbgfs_attrs,\n\t\t\t\tARRAY_SIZE(gpio_virtuser_line_dbgfs_attrs),\n\t\t\t\tdata->ad.dbgfs_dir, data);\n}\n\nstatic void gpio_virtuser_debugfs_remove(void *data)\n{\n\tstruct dentry *dbgfs_entry = data;\n\n\tdebugfs_remove_recursive(dbgfs_entry);\n}\n\nstatic int gpio_virtuser_prop_is_gpio(struct property *prop)\n{\n\tchar *dash = strrchr(prop->name, '-');\n\n\treturn dash && strcmp(dash, \"-gpios\") == 0;\n}\n\n/*\n * If this is an OF-based system, then we iterate over properties and consider\n * all whose names end in \"-gpios\". For configfs we expect an additional string\n * array property - \"gpio-virtuser,ids\" - containing the list of all GPIO IDs\n * to request.\n */\nstatic int gpio_virtuser_count_ids(struct device *dev)\n{\n\tstruct device_node *of_node = dev_of_node(dev);\n\tstruct property *prop;\n\tint ret = 0;\n\n\tif (!of_node)\n\t\treturn device_property_string_array_count(dev,\n\t\t\t\t\t\t\t  \"gpio-virtuser,ids\");\n\n\tfor_each_property_of_node(of_node, prop) {\n\t\tif (gpio_virtuser_prop_is_gpio(prop))\n\t\t\t++ret;\n\t}\n\n\treturn ret;\n}\n\nstatic int gpio_virtuser_get_ids(struct device *dev, const char **ids,\n\t\t\t\t int num_ids)\n{\n\tstruct device_node *of_node = dev_of_node(dev);\n\tstruct property *prop;\n\tsize_t pos = 0, diff;\n\tchar *dash, *tmp;\n\n\tif (!of_node)\n\t\treturn device_property_read_string_array(dev,\n\t\t\t\t\t\t\t \"gpio-virtuser,ids\",\n\t\t\t\t\t\t\t ids, num_ids);\n\n\tfor_each_property_of_node(of_node, prop) {\n\t\tif (!gpio_virtuser_prop_is_gpio(prop))\n\t\t\tcontinue;\n\n\t\tdash = strrchr(prop->name, '-');\n\t\tdiff = dash - prop->name;\n\n\t\ttmp = devm_kmemdup(dev, prop->name, diff + 1,\n\t\t\t\t   GFP_KERNEL);\n\t\tif (!tmp)\n\t\t\treturn -ENOMEM;\n\n\t\ttmp[diff] = '\\0';\n\t\tids[pos++] = tmp;\n\t}\n\n\treturn 0;\n}\n\nstatic int gpio_virtuser_probe(struct platform_device *pdev)\n{\n\tstruct device *dev = &pdev->dev;\n\tstruct dentry *dbgfs_entry;\n\tstruct gpio_descs *descs;\n\tint ret, num_ids = 0, i;\n\tconst char **ids;\n\tunsigned int j;\n\n\tnum_ids = gpio_virtuser_count_ids(dev);\n\tif (num_ids < 0)\n\t\treturn dev_err_probe(dev, num_ids,\n\t\t\t\t     \"Failed to get the number of GPIOs to request\\n\");\n\n\tif (num_ids == 0)\n\t\treturn dev_err_probe(dev, -EINVAL, \"No GPIO IDs specified\\n\");\n\n\tids = devm_kcalloc(dev, num_ids, sizeof(*ids), GFP_KERNEL);\n\tif (!ids)\n\t\treturn -ENOMEM;\n\n\tret = gpio_virtuser_get_ids(dev, ids, num_ids);\n\tif (ret < 0)\n\t\treturn dev_err_probe(dev, ret,\n\t\t\t\t     \"Failed to get the IDs of GPIOs to request\\n\");\n\n\tdbgfs_entry = debugfs_create_dir(dev_name(dev), gpio_virtuser_dbg_root);\n\tret = devm_add_action_or_reset(dev, gpio_virtuser_debugfs_remove,\n\t\t\t\t       dbgfs_entry);\n\tif (ret)\n\t\treturn ret;\n\n\tfor (i = 0; i < num_ids; i++) {\n\t\tdescs = devm_gpiod_get_array(dev, ids[i], GPIOD_ASIS);\n\t\tif (IS_ERR(descs))\n\t\t\treturn dev_err_probe(dev, PTR_ERR(descs),\n\t\t\t\t\t     \"Failed to request the '%s' GPIOs\\n\",\n\t\t\t\t\t     ids[i]);\n\n\t\tret = gpio_virtuser_dbgfs_init_line_array_attrs(dev, descs,\n\t\t\t\t\t\t\t\tids[i],\n\t\t\t\t\t\t\t\tdbgfs_entry);\n\t\tif (ret)\n\t\t\treturn dev_err_probe(dev, ret,\n\t\t\t\t\t     \"Failed to setup the debugfs array interface for the '%s' GPIOs\\n\",\n\t\t\t\t\t     ids[i]);\n\n\t\tfor (j = 0; j < descs->ndescs; j++) {\n\t\t\tret = gpio_virtuser_dbgfs_init_line_attrs(dev,\n\t\t\t\t\t\t\tdescs->desc[j], ids[i],\n\t\t\t\t\t\t\tj, dbgfs_entry);\n\t\t\tif (ret)\n\t\t\t\treturn dev_err_probe(dev, ret,\n\t\t\t\t\t\t     \"Failed to setup the debugfs line interface for the '%s' GPIOs\\n\",\n\t\t\t\t\t\t     ids[i]);\n\t\t}\n\t}\n\n\treturn 0;\n}\n\nstatic const struct of_device_id gpio_virtuser_of_match[] = {\n\t{ .compatible = \"gpio-virtuser\" },\n\t{ }\n};\nMODULE_DEVICE_TABLE(of, gpio_virtuser_of_match);\n\nstatic struct platform_driver gpio_virtuser_driver = {\n\t.driver = {\n\t\t.name = \"gpio-virtuser\",\n\t\t.of_match_table = gpio_virtuser_of_match,\n\t},\n\t.probe = gpio_virtuser_probe,\n};\n\nstruct gpio_virtuser_device {\n\tstruct platform_device *pdev;\n\tstruct config_group group;\n\n\tint id;\n\tstruct mutex lock;\n\n\tstruct gpiod_lookup_table *lookup_table;\n\n\tstruct list_head lookup_list;\n};\n\nstatic struct gpio_virtuser_device *\nto_gpio_virtuser_device(struct config_item *item)\n{\n\tstruct config_group *group = to_config_group(item);\n\n\treturn container_of(group, struct gpio_virtuser_device, group);\n}\n\nstatic bool\ngpio_virtuser_device_is_live(struct gpio_virtuser_device *dev)\n{\n\tlockdep_assert_held(&dev->lock);\n\n\treturn !!dev->pdev;\n}\n\nstruct gpio_virtuser_lookup {\n\tstruct config_group group;\n\n\tstruct gpio_virtuser_device *parent;\n\tstruct list_head siblings;\n\n\tchar *con_id;\n\n\tstruct list_head entry_list;\n};\n\nstatic struct gpio_virtuser_lookup *\nto_gpio_virtuser_lookup(struct config_item *item)\n{\n\tstruct config_group *group = to_config_group(item);\n\n\treturn container_of(group, struct gpio_virtuser_lookup, group);\n}\n\nstruct gpio_virtuser_lookup_entry {\n\tstruct config_group group;\n\n\tstruct gpio_virtuser_lookup *parent;\n\tstruct list_head siblings;\n\n\tchar *key;\n\t/* Can be negative to indicate lookup by name. */\n\tint offset;\n\tenum gpio_lookup_flags flags;\n};\n\nstatic struct gpio_virtuser_lookup_entry *\nto_gpio_virtuser_lookup_entry(struct config_item *item)\n{\n\tstruct config_group *group = to_config_group(item);\n\n\treturn container_of(group, struct gpio_virtuser_lookup_entry, group);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_key_show(struct config_item *item, char *page)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\treturn sprintf(page, \"%s\\n\", entry->key ?: \"\");\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_key_store(struct config_item *item,\n\t\t\t\t\t    const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tchar *key __free(kfree) = kstrndup(skip_spaces(page), count,\n\t\t\t\t\t   GFP_KERNEL);\n\tif (!key)\n\t\treturn -ENOMEM;\n\n\tstrim(key);\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tkfree(entry->key);\n\tentry->key = no_free_ptr(key);\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, key);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_offset_show(struct config_item *item,\n\t\t\t\t\t      char *page)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tunsigned int offset;\n\n\tscoped_guard(mutex, &dev->lock)\n\t\toffset = entry->offset;\n\n\treturn sprintf(page, \"%d\\n\", offset);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_offset_store(struct config_item *item,\n\t\t\t\t\t       const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tint offset, ret;\n\n\tret = kstrtoint(page, 0, &offset);\n\tif (ret)\n\t\treturn ret;\n\n\t/*\n\t * Negative number here means: 'key' represents a line name to lookup.\n\t * Non-negative means: 'key' represents the label of the chip with\n\t * the 'offset' value representing the line within that chip.\n\t *\n\t * GPIOLIB uses the U16_MAX value to indicate lookup by line name so\n\t * the greatest offset we can accept is (U16_MAX - 1).\n\t */\n\tif (offset > (U16_MAX - 1))\n\t\treturn -EINVAL;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tentry->offset = offset;\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, offset);\n\nstatic enum gpio_lookup_flags\ngpio_virtuser_lookup_get_flags(struct config_item *item)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\treturn entry->flags;\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_drive_show(struct config_item *item, char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\tconst char *repr;\n\n\tif (flags & GPIO_OPEN_DRAIN)\n\t\trepr = \"open-drain\";\n\telse if (flags & GPIO_OPEN_SOURCE)\n\t\trepr = \"open-source\";\n\telse\n\t\trepr = \"push-pull\";\n\n\treturn sprintf(page, \"%s\\n\", repr);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_drive_store(struct config_item *item,\n\t\t\t\t\t      const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (sysfs_streq(page, \"push-pull\")) {\n\t\tentry->flags &= ~(GPIO_OPEN_DRAIN | GPIO_OPEN_SOURCE);\n\t} else if (sysfs_streq(page, \"open-drain\")) {\n\t\tentry->flags &= ~GPIO_OPEN_SOURCE;\n\t\tentry->flags |= GPIO_OPEN_DRAIN;\n\t} else if (sysfs_streq(page, \"open-source\")) {\n\t\tentry->flags &= ~GPIO_OPEN_DRAIN;\n\t\tentry->flags |= GPIO_OPEN_SOURCE;\n\t} else {\n\t\tcount = -EINVAL;\n\t}\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, drive);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_pull_show(struct config_item *item, char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\tconst char *repr;\n\n\tif (flags & GPIO_PULL_UP)\n\t\trepr = \"pull-up\";\n\telse if (flags & GPIO_PULL_DOWN)\n\t\trepr = \"pull-down\";\n\telse if (flags & GPIO_PULL_DISABLE)\n\t\trepr = \"pull-disabled\";\n\telse\n\t\trepr = \"as-is\";\n\n\treturn sprintf(page, \"%s\\n\", repr);\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_pull_store(struct config_item *item,\n\t\t\t\t\t     const char *page, size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (sysfs_streq(page, \"pull-up\")) {\n\t\tentry->flags &= ~(GPIO_PULL_DOWN | GPIO_PULL_DISABLE);\n\t\tentry->flags |= GPIO_PULL_UP;\n\t} else if (sysfs_streq(page, \"pull-down\")) {\n\t\tentry->flags &= ~(GPIO_PULL_UP | GPIO_PULL_DISABLE);\n\t\tentry->flags |= GPIO_PULL_DOWN;\n\t} else if (sysfs_streq(page, \"pull-disabled\")) {\n\t\tentry->flags &= ~(GPIO_PULL_UP | GPIO_PULL_DOWN);\n\t\tentry->flags |= GPIO_PULL_DISABLE;\n\t} else if (sysfs_streq(page, \"as-is\")) {\n\t\tentry->flags &= ~(GPIO_PULL_UP | GPIO_PULL_DOWN |\n\t\t\t\t  GPIO_PULL_DISABLE);\n\t} else {\n\t\tcount = -EINVAL;\n\t}\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, pull);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_active_low_show(struct config_item *item,\n\t\t\t\t\t\t  char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\n\treturn sprintf(page, \"%c\\n\", flags & GPIO_ACTIVE_LOW ? '1' : '0');\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_active_low_store(struct config_item *item,\n\t\t\t\t\t\t   const char *page,\n\t\t\t\t\t\t   size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tbool active_low;\n\tint ret;\n\n\tret = kstrtobool(page, &active_low);\n\tif (ret)\n\t\treturn ret;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (active_low)\n\t\tentry->flags |= GPIO_ACTIVE_LOW;\n\telse\n\t\tentry->flags &= ~GPIO_ACTIVE_LOW;\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, active_low);\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_transitory_show(struct config_item *item,\n\t\t\t\t\t\t  char *page)\n{\n\tenum gpio_lookup_flags flags = gpio_virtuser_lookup_get_flags(item);\n\n\treturn sprintf(page, \"%c\\n\", flags & GPIO_TRANSITORY ? '1' : '0');\n}\n\nstatic ssize_t\ngpio_virtuser_lookup_entry_config_transitory_store(struct config_item *item,\n\t\t\t\t\t\t   const char *page,\n\t\t\t\t\t\t   size_t count)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\tbool transitory;\n\tint ret;\n\n\tret = kstrtobool(page, &transitory);\n\tif (ret)\n\t\treturn ret;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn -EBUSY;\n\n\tif (transitory)\n\t\tentry->flags |= GPIO_TRANSITORY;\n\telse\n\t\tentry->flags &= ~GPIO_TRANSITORY;\n\n\treturn count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_lookup_entry_config_, transitory);\n\nstatic struct configfs_attribute *gpio_virtuser_lookup_entry_config_attrs[] = {\n\t&gpio_virtuser_lookup_entry_config_attr_key,\n\t&gpio_virtuser_lookup_entry_config_attr_offset,\n\t&gpio_virtuser_lookup_entry_config_attr_drive,\n\t&gpio_virtuser_lookup_entry_config_attr_pull,\n\t&gpio_virtuser_lookup_entry_config_attr_active_low,\n\t&gpio_virtuser_lookup_entry_config_attr_transitory,\n\tNULL\n};\n\nstatic ssize_t\ngpio_virtuser_device_config_dev_name_show(struct config_item *item,\n\t\t\t\t\t  char *page)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\tstruct platform_device *pdev;\n\n\tguard(mutex)(&dev->lock);\n\n\tpdev = dev->pdev;\n\tif (pdev)\n\t\treturn sprintf(page, \"%s\\n\", dev_name(&pdev->dev));\n\n\treturn sprintf(page, \"gpio-sim.%d\\n\", dev->id);\n}\n\nCONFIGFS_ATTR_RO(gpio_virtuser_device_config_, dev_name);\n\nstatic ssize_t gpio_virtuser_device_config_live_show(struct config_item *item,\n\t\t\t\t\t\t     char *page)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\tbool live;\n\n\tscoped_guard(mutex, &dev->lock)\n\t\tlive = gpio_virtuser_device_is_live(dev);\n\n\treturn sprintf(page, \"%c\\n\", live ? '1' : '0');\n}\n\nstatic size_t\ngpio_virtuser_get_lookup_count(struct gpio_virtuser_device *dev)\n{\n\tstruct gpio_virtuser_lookup *lookup;\n\tsize_t count = 0;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings)\n\t\tcount += list_count_nodes(&lookup->entry_list);\n\n\treturn count;\n}\n\nstatic int\ngpio_virtuser_make_lookup_table(struct gpio_virtuser_device *dev)\n{\n\tsize_t num_entries = gpio_virtuser_get_lookup_count(dev);\n\tstruct gpio_virtuser_lookup_entry *entry;\n\tstruct gpio_virtuser_lookup *lookup;\n\tunsigned int i = 0, idx;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tstruct gpiod_lookup_table *table __free(kfree) =\n\t\tkzalloc_flex(*table, table, num_entries + 1);\n\tif (!table)\n\t\treturn -ENOMEM;\n\n\ttable->dev_id = kasprintf(GFP_KERNEL, \"gpio-virtuser.%d\", dev->id);\n\tif (!table->dev_id)\n\t\treturn -ENOMEM;\n\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings) {\n\t\tidx = 0;\n\t\tlist_for_each_entry(entry, &lookup->entry_list, siblings) {\n\t\t\ttable->table[i++] =\n\t\t\t\tGPIO_LOOKUP_IDX(entry->key,\n\t\t\t\t\t\tentry->offset < 0 ? U16_MAX : entry->offset,\n\t\t\t\t\t\tlookup->con_id, idx++, entry->flags);\n\t\t}\n\t}\n\n\tgpiod_add_lookup_table(table);\n\tdev->lookup_table = no_free_ptr(table);\n\n\treturn 0;\n}\n\nstatic void\ngpio_virtuser_remove_lookup_table(struct gpio_virtuser_device *dev)\n{\n\tgpiod_remove_lookup_table(dev->lookup_table);\n\tkfree(dev->lookup_table->dev_id);\n\tkfree(dev->lookup_table);\n\tdev->lookup_table = NULL;\n}\n\nstatic struct fwnode_handle *\ngpio_virtuser_make_device_swnode(struct gpio_virtuser_device *dev)\n{\n\tstruct property_entry properties[2];\n\tstruct gpio_virtuser_lookup *lookup;\n\tunsigned int i = 0;\n\tsize_t num_ids;\n\n\tmemset(properties, 0, sizeof(properties));\n\n\tnum_ids = list_count_nodes(&dev->lookup_list);\n\tchar **ids __free(kfree) = kcalloc(num_ids + 1, sizeof(*ids),\n\t\t\t\t\t   GFP_KERNEL);\n\tif (!ids)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings)\n\t\tids[i++] = lookup->con_id;\n\n\tproperties[0] = PROPERTY_ENTRY_STRING_ARRAY_LEN(\"gpio-virtuser,ids\",\n\t\t\t\t\t\t\tids, num_ids);\n\n\treturn fwnode_create_software_node(properties, NULL);\n}\n\nstatic int\ngpio_virtuser_device_activate(struct gpio_virtuser_device *dev)\n{\n\tstruct platform_device_info pdevinfo;\n\tstruct platform_device *pdev;\n\tstruct fwnode_handle *swnode;\n\tint ret;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tif (list_empty(&dev->lookup_list))\n\t\treturn -ENODATA;\n\n\tswnode = gpio_virtuser_make_device_swnode(dev);\n\tif (IS_ERR(swnode))\n\t\treturn PTR_ERR(swnode);\n\n\tmemset(&pdevinfo, 0, sizeof(pdevinfo));\n\tpdevinfo.name = \"gpio-virtuser\";\n\tpdevinfo.id = dev->id;\n\tpdevinfo.fwnode = swnode;\n\n\tret = gpio_virtuser_make_lookup_table(dev);\n\tif (ret)\n\t\tgoto err_remove_swnode;\n\n\tpdev = platform_device_register_full(&pdevinfo);\n\tif (IS_ERR(pdev)) {\n\t\tret = PTR_ERR(pdev);\n\t\tgoto err_remove_lookup_table;\n\t}\n\n\twait_for_device_probe();\n\n\tscoped_guard(device, &pdev->dev) {\n\t\tif (!device_is_bound(&pdev->dev)) {\n\t\t\tret = -ENXIO;\n\t\t\tgoto err_unregister_pdev;\n\t\t}\n\t}\n\n\tdev->pdev = pdev;\n\treturn 0;\n\nerr_unregister_pdev:\n\tplatform_device_unregister(pdev);\nerr_remove_lookup_table:\n\tgpio_virtuser_remove_lookup_table(dev);\nerr_remove_swnode:\n\tfwnode_remove_software_node(swnode);\n\n\treturn ret;\n}\n\nstatic void\ngpio_virtuser_device_deactivate(struct gpio_virtuser_device *dev)\n{\n\tstruct fwnode_handle *swnode;\n\n\tlockdep_assert_held(&dev->lock);\n\n\tswnode = dev_fwnode(&dev->pdev->dev);\n\tplatform_device_unregister(dev->pdev);\n\tdev->pdev = NULL;\n\tgpio_virtuser_remove_lookup_table(dev);\n\tfwnode_remove_software_node(swnode);\n}\n\nstatic void\ngpio_virtuser_device_lockup_configfs(struct gpio_virtuser_device *dev, bool lock)\n{\n\tstruct configfs_subsystem *subsys = dev->group.cg_subsys;\n\tstruct gpio_virtuser_lookup_entry *entry;\n\tstruct gpio_virtuser_lookup *lookup;\n\n\t/*\n\t * The device only needs to depend on leaf lookup entries. This is\n\t * sufficient to lock up all the configfs entries that the\n\t * instantiated, alive device depends on.\n\t */\n\tlist_for_each_entry(lookup, &dev->lookup_list, siblings) {\n\t\tlist_for_each_entry(entry, &lookup->entry_list, siblings) {\n\t\t\tif (lock)\n\t\t\t\tWARN_ON(configfs_depend_item_unlocked(\n\t\t\t\t\t\tsubsys, &entry->group.cg_item));\n\t\t\telse\n\t\t\t\tconfigfs_undepend_item_unlocked(\n\t\t\t\t\t\t&entry->group.cg_item);\n\t\t}\n\t}\n}\n\nstatic ssize_t\ngpio_virtuser_device_config_live_store(struct config_item *item,\n\t\t\t\t       const char *page, size_t count)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\tint ret = 0;\n\tbool live;\n\n\tret = kstrtobool(page, &live);\n\tif (ret)\n\t\treturn ret;\n\n\tif (live)\n\t\tgpio_virtuser_device_lockup_configfs(dev, true);\n\n\tscoped_guard(mutex, &dev->lock) {\n\t\tif (live == gpio_virtuser_device_is_live(dev))\n\t\t\tret = -EPERM;\n\t\telse if (live)\n\t\t\tret = gpio_virtuser_device_activate(dev);\n\t\telse\n\t\t\tgpio_virtuser_device_deactivate(dev);\n\t}\n\n\t/*\n\t * Undepend is required only if device disablement (live == 0)\n\t * succeeds or if device enablement (live == 1) fails.\n\t */\n\tif (live == !!ret)\n\t\tgpio_virtuser_device_lockup_configfs(dev, false);\n\n\treturn ret ?: count;\n}\n\nCONFIGFS_ATTR(gpio_virtuser_device_config_, live);\n\nstatic struct configfs_attribute *gpio_virtuser_device_config_attrs[] = {\n\t&gpio_virtuser_device_config_attr_dev_name,\n\t&gpio_virtuser_device_config_attr_live,\n\tNULL\n};\n\nstatic void\ngpio_virtuser_lookup_entry_config_group_release(struct config_item *item)\n{\n\tstruct gpio_virtuser_lookup_entry *entry =\n\t\t\t\t\tto_gpio_virtuser_lookup_entry(item);\n\tstruct gpio_virtuser_device *dev = entry->parent->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tlist_del(&entry->siblings);\n\n\tkfree(entry->key);\n\tkfree(entry);\n}\n\nstatic struct\nconfigfs_item_operations gpio_virtuser_lookup_entry_config_item_ops = {\n\t.release\t= gpio_virtuser_lookup_entry_config_group_release,\n};\n\nstatic const struct\nconfig_item_type gpio_virtuser_lookup_entry_config_group_type = {\n\t.ct_item_ops\t= &gpio_virtuser_lookup_entry_config_item_ops,\n\t.ct_attrs\t= gpio_virtuser_lookup_entry_config_attrs,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct config_group *\ngpio_virtuser_make_lookup_entry_group(struct config_group *group,\n\t\t\t\t      const char *name)\n{\n\tstruct gpio_virtuser_lookup *lookup =\n\t\t\t\tto_gpio_virtuser_lookup(&group->cg_item);\n\tstruct gpio_virtuser_device *dev = lookup->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn ERR_PTR(-EBUSY);\n\n\tstruct gpio_virtuser_lookup_entry *entry __free(kfree) =\n\t\t\t\tkzalloc_obj(*entry);\n\tif (!entry)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tconfig_group_init_type_name(&entry->group, name,\n\t\t\t&gpio_virtuser_lookup_entry_config_group_type);\n\tentry->flags = GPIO_LOOKUP_FLAGS_DEFAULT;\n\tentry->parent = lookup;\n\tlist_add_tail(&entry->siblings, &lookup->entry_list);\n\n\treturn &no_free_ptr(entry)->group;\n}\n\nstatic void gpio_virtuser_lookup_config_group_release(struct config_item *item)\n{\n\tstruct gpio_virtuser_lookup *lookup = to_gpio_virtuser_lookup(item);\n\tstruct gpio_virtuser_device *dev = lookup->parent;\n\n\tguard(mutex)(&dev->lock);\n\n\tlist_del(&lookup->siblings);\n\n\tkfree(lookup->con_id);\n\tkfree(lookup);\n}\n\nstatic const struct configfs_item_operations gpio_virtuser_lookup_config_item_ops = {\n\t.release\t= gpio_virtuser_lookup_config_group_release,\n};\n\nstatic struct\nconfigfs_group_operations gpio_virtuser_lookup_config_group_ops = {\n\t.make_group     = gpio_virtuser_make_lookup_entry_group,\n};\n\nstatic const struct config_item_type gpio_virtuser_lookup_config_group_type = {\n\t.ct_group_ops\t= &gpio_virtuser_lookup_config_group_ops,\n\t.ct_item_ops\t= &gpio_virtuser_lookup_config_item_ops,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct config_group *\ngpio_virtuser_make_lookup_group(struct config_group *group, const char *name)\n{\n\tstruct gpio_virtuser_device *dev =\n\t\t\t\tto_gpio_virtuser_device(&group->cg_item);\n\n\tif (strlen(name) > (GPIO_VIRTUSER_NAME_BUF_LEN - 1))\n\t\treturn ERR_PTR(-E2BIG);\n\n\tguard(mutex)(&dev->lock);\n\n\tif (gpio_virtuser_device_is_live(dev))\n\t\treturn ERR_PTR(-EBUSY);\n\n\tstruct gpio_virtuser_lookup *lookup __free(kfree) =\n\t\t\t\tkzalloc_obj(*lookup);\n\tif (!lookup)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tlookup->con_id = kstrdup(name, GFP_KERNEL);\n\tif (!lookup->con_id)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tconfig_group_init_type_name(&lookup->group, name,\n\t\t\t\t    &gpio_virtuser_lookup_config_group_type);\n\tINIT_LIST_HEAD(&lookup->entry_list);\n\tlookup->parent = dev;\n\tlist_add_tail(&lookup->siblings, &dev->lookup_list);\n\n\treturn &no_free_ptr(lookup)->group;\n}\n\nstatic void gpio_virtuser_device_config_group_release(struct config_item *item)\n{\n\tstruct gpio_virtuser_device *dev = to_gpio_virtuser_device(item);\n\n\tscoped_guard(mutex, &dev->lock) {\n\t\tif (gpio_virtuser_device_is_live(dev))\n\t\t\tgpio_virtuser_device_deactivate(dev);\n\t}\n\n\tmutex_destroy(&dev->lock);\n\tida_free(&gpio_virtuser_ida, dev->id);\n\tkfree(dev);\n}\n\nstatic const struct configfs_item_operations gpio_virtuser_device_config_item_ops = {\n\t.release\t= gpio_virtuser_device_config_group_release,\n};\n\nstatic const struct configfs_group_operations gpio_virtuser_device_config_group_ops = {\n\t.make_group\t= gpio_virtuser_make_lookup_group,\n};\n\nstatic const struct config_item_type gpio_virtuser_device_config_group_type = {\n\t.ct_group_ops\t= &gpio_virtuser_device_config_group_ops,\n\t.ct_item_ops\t= &gpio_virtuser_device_config_item_ops,\n\t.ct_attrs\t= gpio_virtuser_device_config_attrs,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct config_group *\ngpio_virtuser_config_make_device_group(struct config_group *group,\n\t\t\t\t       const char *name)\n{\n\tstruct gpio_virtuser_device *dev __free(kfree) = kzalloc_obj(*dev);\n\tif (!dev)\n\t\treturn ERR_PTR(-ENOMEM);\n\n\tdev->id = ida_alloc(&gpio_virtuser_ida, GFP_KERNEL);\n\tif (dev->id < 0)\n\t\treturn ERR_PTR(dev->id);\n\n\tconfig_group_init_type_name(&dev->group, name,\n\t\t\t\t    &gpio_virtuser_device_config_group_type);\n\tmutex_init(&dev->lock);\n\tINIT_LIST_HEAD(&dev->lookup_list);\n\n\treturn &no_free_ptr(dev)->group;\n}\n\nstatic const struct configfs_group_operations gpio_virtuser_config_group_ops = {\n\t.make_group\t= gpio_virtuser_config_make_device_group,\n};\n\nstatic const struct config_item_type gpio_virtuser_config_type = {\n\t.ct_group_ops\t= &gpio_virtuser_config_group_ops,\n\t.ct_owner\t= THIS_MODULE,\n};\n\nstatic struct configfs_subsystem gpio_virtuser_config_subsys = {\n\t.su_group = {\n\t\t.cg_item = {\n\t\t\t.ci_namebuf\t= \"gpio-virtuser\",\n\t\t\t.ci_type\t= &gpio_virtuser_config_type,\n\t\t},\n\t},\n};\n\nstatic int __init gpio_virtuser_init(void)\n{\n\tint ret;\n\n\tret = platform_driver_register(&gpio_virtuser_driver);\n\tif (ret) {\n\t\tpr_err(\"Failed to register the platform driver: %d\\n\", ret);\n\t\treturn ret;\n\t}\n\n\tconfig_group_init(&gpio_virtuser_config_subsys.su_group);\n\tmutex_init(&gpio_virtuser_config_subsys.su_mutex);\n\tret = configfs_register_subsystem(&gpio_virtuser_config_subsys);\n\tif (ret) {\n\t\tpr_err(\"Failed to register the '%s' configfs subsystem: %d\\n\",\n\t\t       gpio_virtuser_config_subsys.su_group.cg_item.ci_namebuf,\n\t\t       ret);\n\t\tgoto err_plat_drv_unreg;\n\t}\n\n\tgpio_virtuser_dbg_root = debugfs_create_dir(\"gpio-virtuser\", NULL);\n\tif (IS_ERR(gpio_virtuser_dbg_root)) {\n\t\tret = PTR_ERR(gpio_virtuser_dbg_root);\n\t\tpr_err(\"Failed to create the debugfs tree: %d\\n\", ret);\n\t\tgoto err_configfs_unreg;\n\t}\n\n\treturn 0;\n\nerr_configfs_unreg:\n\tconfigfs_unregister_subsystem(&gpio_virtuser_config_subsys);\nerr_plat_drv_unreg:\n\tmutex_destroy(&gpio_virtuser_config_subsys.su_mutex);\n\tplatform_driver_unregister(&gpio_virtuser_driver);\n\n\treturn ret;\n}\nmodule_init(gpio_virtuser_init);\n\nstatic void __exit gpio_virtuser_exit(void)\n{\n\tconfigfs_unregister_subsystem(&gpio_virtuser_config_subsys);\n\tmutex_destroy(&gpio_virtuser_config_subsys.su_mutex);\n\tplatform_driver_unregister(&gpio_virtuser_driver);\n\tdebugfs_remove_recursive(gpio_virtuser_dbg_root);\n}\nmodule_exit(gpio_virtuser_exit);\n\nMODULE_AUTHOR(\"Bartosz Golaszewski <bartosz.golaszewski@linaro.org>\");\nMODULE_DESCRIPTION(\"Virtual GPIO consumer module\");\nMODULE_LICENSE(\"GPL\");\n",
+      "before_lines": [
+        695
+      ],
+      "after_lines": [
+        695,
+        696
+      ]
+    }
+  ],
+  "functions": [
+    {
+      "name": "gpio_virtuser_interrupts_set",
+      "before": {
+        "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+        "path": "drivers/gpio/gpio-virtuser.c",
+        "start_line": 670,
+        "end_line": 699,
+        "kind": "function",
+        "symbol": "gpio_virtuser_interrupts_set",
+        "reason": "changed function or its pre-fix counterpart",
+        "text": "static int gpio_virtuser_interrupts_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint irq, ret;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tif (val) {\n\t\tirq = gpiod_to_irq(ld->ad.desc);\n\t\tif (irq < 0)\n\t\t\treturn irq;\n\n\t\tret = request_threaded_irq(irq, NULL,\n\t\t\t\t\t   gpio_virtuser_irq_handler,\n\t\t\t\t\t   IRQF_TRIGGER_RISING |\n\t\t\t\t\t   IRQF_TRIGGER_FALLING |\n\t\t\t\t\t   IRQF_ONESHOT,\n\t\t\t\t\t   ld->consumer, data);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tatomic_set(&ld->irq, irq);\n\t} else {\n\t\tirq = atomic_xchg(&ld->irq, 0);\n\t\tfree_irq(irq, ld);\n\t}\n\n\treturn 0;\n}"
+      },
+      "after": {
+        "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+        "path": "drivers/gpio/gpio-virtuser.c",
+        "start_line": 670,
+        "end_line": 700,
+        "kind": "function",
+        "symbol": "gpio_virtuser_interrupts_set",
+        "reason": "changed function or its post-fix counterpart",
+        "text": "static int gpio_virtuser_interrupts_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint irq, ret;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tif (val) {\n\t\tirq = gpiod_to_irq(ld->ad.desc);\n\t\tif (irq < 0)\n\t\t\treturn irq;\n\n\t\tret = request_threaded_irq(irq, NULL,\n\t\t\t\t\t   gpio_virtuser_irq_handler,\n\t\t\t\t\t   IRQF_TRIGGER_RISING |\n\t\t\t\t\t   IRQF_TRIGGER_FALLING |\n\t\t\t\t\t   IRQF_ONESHOT,\n\t\t\t\t\t   ld->consumer, data);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tatomic_set(&ld->irq, irq);\n\t} else {\n\t\tirq = atomic_xchg(&ld->irq, 0);\n\t\tif (irq)\n\t\t\tfree_irq(irq, ld);\n\t}\n\n\treturn 0;\n}"
+      }
+    }
+  ],
+  "fallback": [],
+  "supplements": [
+    {
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/gpio/consumer.h",
+      "start_line": 519,
+      "end_line": 524,
+      "kind": "function",
+      "symbol": "gpiod_to_irq",
+      "reason": "referenced by changed code: gpiod_to_irq",
+      "text": "static inline int gpiod_to_irq(const struct gpio_desc *desc)\n{\n\t/* GPIO can never have been requested */\n\tWARN_ON(desc);\n\treturn -EINVAL;\n}"
+    },
+    {
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/gpio/consumer.h",
+      "start_line": 519,
+      "end_line": 524,
+      "kind": "function",
+      "symbol": "gpiod_to_irq",
+      "reason": "referenced by changed code: gpiod_to_irq",
+      "text": "static inline int gpiod_to_irq(const struct gpio_desc *desc)\n{\n\t/* GPIO can never have been requested */\n\tWARN_ON(desc);\n\treturn -EINVAL;\n}"
+    },
+    {
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/interrupt.h",
+      "start_line": 154,
+      "end_line": 157,
+      "kind": "declaration",
+      "symbol": "request_threaded_irq",
+      "reason": "referenced by changed code: request_threaded_irq",
+      "text": "extern int __must_check\nrequest_threaded_irq(unsigned int irq, irq_handler_t handler,\n\t\t     irq_handler_t thread_fn,\n\t\t     unsigned long flags, const char *name, void *dev);"
+    },
+    {
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/interrupt.h",
+      "start_line": 154,
+      "end_line": 157,
+      "kind": "declaration",
+      "symbol": "request_threaded_irq",
+      "reason": "referenced by changed code: request_threaded_irq",
+      "text": "extern int __must_check\nrequest_threaded_irq(unsigned int irq, irq_handler_t handler,\n\t\t     irq_handler_t thread_fn,\n\t\t     unsigned long flags, const char *name, void *dev);"
+    },
+    {
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic/atomic-instrumented.h",
+      "start_line": 64,
+      "end_line": 69,
+      "kind": "function",
+      "symbol": "atomic_set",
+      "reason": "referenced by changed code: atomic_set",
+      "text": "static __always_inline void\natomic_set(atomic_t *v, int i)\n{\n\tinstrument_atomic_write(v, sizeof(*v));\n\traw_atomic_set(v, i);\n}"
+    },
+    {
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic/atomic-instrumented.h",
+      "start_line": 64,
+      "end_line": 69,
+      "kind": "function",
+      "symbol": "atomic_set",
+      "reason": "referenced by changed code: atomic_set",
+      "text": "static __always_inline void\natomic_set(atomic_t *v, int i)\n{\n\tinstrument_atomic_write(v, sizeof(*v));\n\traw_atomic_set(v, i);\n}"
+    },
+    {
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/instrumented.h",
+      "start_line": 95,
+      "end_line": 100,
+      "kind": "function",
+      "symbol": "instrument_atomic_write",
+      "reason": "one-level callee of atomic_set",
+      "text": "static __always_inline void instrument_atomic_write(const volatile void *v, size_t size)\n{\n\tkasan_check_write(v, size);\n\tkcsan_check_atomic_write(v, size);\n\tinstrument_atomic_check_alignment(v, size);\n}"
+    },
+    {
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic/atomic-arch-fallback.h",
+      "start_line": 500,
+      "end_line": 504,
+      "kind": "function",
+      "symbol": "raw_atomic_set",
+      "reason": "one-level callee of atomic_set",
+      "text": "static __always_inline void\nraw_atomic_set(atomic_t *v, int i)\n{\n\tarch_atomic_set(v, i);\n}"
+    },
+    {
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/instrumented.h",
+      "start_line": 95,
+      "end_line": 100,
+      "kind": "function",
+      "symbol": "instrument_atomic_write",
+      "reason": "one-level callee of atomic_set",
+      "text": "static __always_inline void instrument_atomic_write(const volatile void *v, size_t size)\n{\n\tkasan_check_write(v, size);\n\tkcsan_check_atomic_write(v, size);\n\tinstrument_atomic_check_alignment(v, size);\n}"
+    },
+    {
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic/atomic-arch-fallback.h",
+      "start_line": 500,
+      "end_line": 504,
+      "kind": "function",
+      "symbol": "raw_atomic_set",
+      "reason": "one-level callee of atomic_set",
+      "text": "static __always_inline void\nraw_atomic_set(atomic_t *v, int i)\n{\n\tarch_atomic_set(v, i);\n}"
+    },
+    {
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic/atomic-instrumented.h",
+      "start_line": 1115,
+      "end_line": 1121,
+      "kind": "function",
+      "symbol": "atomic_xchg",
+      "reason": "referenced by changed code: atomic_xchg",
+      "text": "static __always_inline int\natomic_xchg(atomic_t *v, int new)\n{\n\tkcsan_mb();\n\tinstrument_atomic_read_write(v, sizeof(*v));\n\treturn raw_atomic_xchg(v, new);\n}"
+    },
+    {
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic/atomic-instrumented.h",
+      "start_line": 1115,
+      "end_line": 1121,
+      "kind": "function",
+      "symbol": "atomic_xchg",
+      "reason": "referenced by changed code: atomic_xchg",
+      "text": "static __always_inline int\natomic_xchg(atomic_t *v, int new)\n{\n\tkcsan_mb();\n\tinstrument_atomic_read_write(v, sizeof(*v));\n\treturn raw_atomic_xchg(v, new);\n}"
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "drivers/gpio/gpio-virtuser.c",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "drivers/gpio/gpio-virtuser.c",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/atomic.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic.h",
+      "line": 7
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/bitmap.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/cleanup.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/configfs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/debugfs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/device.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/err.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/errno.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/err.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/gpio/consumer.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/idr.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/interrupt.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/ptrace.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/interrupt.h",
+      "line": 20
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irq.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/interrupt.h",
+      "line": 21
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/sections.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/interrupt.h",
+      "line": 22
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irq_work.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/irq_work.h",
+      "line": 59
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/list.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/list.h",
+      "line": 11
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/lockdep.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/lockdep.h",
+      "line": 15
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/module.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/module.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/module.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/mutex.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/current.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/mutex.h",
+      "line": 14
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/mutex.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/notifier.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/of.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/of.h",
+      "line": 23
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/prom.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/of.h",
+      "line": 252
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/overflow.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/platform_device.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/printk.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/property.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/slab.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/string_helpers.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/rwonce.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/compiler.h",
+      "line": 369
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic/atomic-arch-fallback.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic/atomic-long.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic/atomic-long.h",
+      "line": 10
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/atomic/atomic-instrumented.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/bitops.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/bitops.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bitops.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/bitops.h",
+      "line": 67
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/string.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/string.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/string.h",
+      "line": 65
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/bitmap-str.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/args.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/stat.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/stat.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/kref.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/fs.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/fs.h",
+      "line": 51
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/seq_file.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/dev_printk.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/energy_model.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/kobject.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/gfp.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device/bus.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device/class.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device/devres.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bug.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device/devres.h",
+      "line": 11
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device/devres.h",
+      "line": 12
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/device/driver.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/bug.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bug.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/bug.h",
+      "line": 5
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/kernel.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/kernel.h",
+      "line": 38
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/radix-tree.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/percpu.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/percpu.h",
+      "line": 15
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/irqnr.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/hardirq.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hardirq.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/hardirq.h",
+      "line": 11
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/irqflags.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irqflags.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/irqflags.h",
+      "line": 18
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/irqflags.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/hrtimer.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/cpumask_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/workqueue.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/jump_label.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/jump_label.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/jump_label.h",
+      "line": 106
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/rcuwait.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/stddef.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/smp.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/smp.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/smp.h",
+      "line": 119
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/linkage.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/linkage.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/linkage.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/debug_locks.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/errno.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/stacktrace.h",
+      "line": 6
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/cache.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/cache.h",
+      "line": 7
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/kmod.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/init.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/elf.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/elf.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/stringify.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/export.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/rbtree_latch.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/tracepoint-defs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/srcu.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/dynamic_debug.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/mutex_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/rwsem.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/param.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/ratelimit_types.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/fwnode.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/rcupdate.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/rcupdate.h",
+      "line": 31
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/percpu-refcount.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/hash.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/hash.h",
+      "line": 6
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hash.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/hash.h",
+      "line": 46
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/kasan.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/kasan.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/kasan.h",
+      "line": 21
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/alloc_tag.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/alloc_tag.h",
+      "line": 12
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/uapi/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/uapi/linux/types.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/posix_types.h",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/uapi/linux/types.h",
+      "line": 14
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/compiler_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/compiler_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/asm-generic/atomic64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/asm-generic/atomic64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/build_bug.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/instrumented.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/linux/instrumented.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/vdso/align.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/uapi/linux/kernel.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/asm-generic/bitops/generic-non-atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/asm-generic/bitops/generic-non-atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/uapi/linux/errno.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": "include/uapi/linux/string.h",
+      "line": null
+    },
+    {
+      "code": "source_file_limit",
+      "message": "Local source search file budget reached",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/atomic.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic.h",
+      "line": 7
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/bitmap.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/cleanup.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/configfs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/debugfs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/device.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/err.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/errno.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/err.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/gpio/consumer.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/idr.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/interrupt.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/ptrace.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/interrupt.h",
+      "line": 20
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irq.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/interrupt.h",
+      "line": 21
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/sections.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/interrupt.h",
+      "line": 22
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irq_work.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/irq_work.h",
+      "line": 59
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/list.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/barrier.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/list.h",
+      "line": 11
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/lockdep.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/lockdep.h",
+      "line": 15
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/module.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/module.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/module.h",
+      "line": 34
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/mutex.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/current.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/mutex.h",
+      "line": 14
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/mutex.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/notifier.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/of.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/of.h",
+      "line": 23
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/prom.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/of.h",
+      "line": 252
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/overflow.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/platform_device.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/printk.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/property.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/slab.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/string_helpers.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/rwonce.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/compiler.h",
+      "line": 369
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic/atomic-arch-fallback.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic/atomic-long.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic/atomic-long.h",
+      "line": 10
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/atomic/atomic-instrumented.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/bitops.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/bitops.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bitops.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/bitops.h",
+      "line": 67
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/string.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/string.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/string.h",
+      "line": 65
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/bitmap-str.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/args.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/stat.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/stat.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/kref.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/fs.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/fs.h",
+      "line": 51
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/seq_file.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/dev_printk.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/energy_model.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/kobject.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/gfp.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device/bus.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device/class.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device/devres.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bug.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device/devres.h",
+      "line": 11
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device/devres.h",
+      "line": 12
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/device/driver.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/bug.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/bug.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/bug.h",
+      "line": 5
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/kernel.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/byteorder.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/kernel.h",
+      "line": 38
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/radix-tree.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/percpu.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/percpu.h",
+      "line": 15
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/irqnr.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/hardirq.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hardirq.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/hardirq.h",
+      "line": 11
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/irqflags.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/irqflags.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/irqflags.h",
+      "line": 18
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/irqflags.h",
+      "line": 19
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/hrtimer.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/cpumask_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/workqueue.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/jump_label.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/jump_label.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/jump_label.h",
+      "line": 106
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/rcuwait.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/stddef.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/smp.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/smp.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/smp.h",
+      "line": 119
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/linkage.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/linkage.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/linkage.h",
+      "line": 8
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/debug_locks.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/errno.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/stacktrace.h",
+      "line": 6
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/cache.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/cache.h",
+      "line": 7
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/kmod.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/init.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/elf.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/elf.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/stringify.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/export.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/rbtree_latch.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/tracepoint-defs.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/srcu.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/dynamic_debug.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/mutex_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/rwsem.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/param.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/ratelimit_types.h",
+      "line": 6
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/fwnode.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/rcupdate.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/processor.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/rcupdate.h",
+      "line": 31
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/percpu-refcount.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/hash.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/hash.h",
+      "line": 6
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/hash.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/hash.h",
+      "line": 46
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/kasan.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/kasan.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/kasan.h",
+      "line": 21
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/alloc_tag.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/percpu.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/alloc_tag.h",
+      "line": 12
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/uapi/linux/types.h",
+      "line": null
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve asm/types.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/uapi/linux/types.h",
+      "line": 5
+    },
+    {
+      "code": "include_unresolved",
+      "message": "Cannot resolve linux/posix_types.h",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/uapi/linux/types.h",
+      "line": 14
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/compiler_types.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/compiler_types.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/asm-generic/atomic64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/asm-generic/atomic64.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/build_bug.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/instrumented.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/linux/instrumented.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/vdso/align.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/uapi/linux/kernel.h",
+      "line": null
+    },
+    {
+      "code": "parse_error",
+      "message": "C parse errors; extracted spans are best effort",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/asm-generic/bitops/generic-non-atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/asm-generic/bitops/generic-non-atomic.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/uapi/linux/errno.h",
+      "line": null
+    },
+    {
+      "code": "include_depth_limit",
+      "message": "Include depth budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": "include/uapi/linux/string.h",
+      "line": null
+    },
+    {
+      "code": "source_file_limit",
+      "message": "Local source search file budget reached",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "symbol_unresolved",
+      "message": "WARN_ON: 0 local matches",
+      "revision": "1f1d0812f6a8ab8e6f709c599f137c99646512cc",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "symbol_unresolved",
+      "message": "WARN_ON: 0 local matches",
+      "revision": "50fd0ada8d37587223001600933270b59cb30e19",
+      "path": null,
+      "line": null
+    },
+    {
+      "code": "supplement_entry_limit",
+      "message": "Supplement entry budget reached",
+      "revision": null,
+      "path": null,
+      "line": null
+    }
+  ],
+  "limits": {
+    "include_depth": 3,
+    "source_files": 128,
+    "seed_symbols": 32,
+    "root_symbols": 6,
+    "supplement_entries": 12,
+    "wrapper_lines": 24,
+    "source_bytes": 2097152,
+    "markdown_chars": 32000
+  },
+  "markdown": "# Repair commit context\n\nCommit: `50fd0ada8d37587223001600933270b59cb30e19`\n\nParent: `1f1d0812f6a8ab8e6f709c599f137c99646512cc`\n\n## Commit message\n\n### Description\n\n```text\ngpio: virtuser: skip free_irq when no IRQ is installed\n\nDisabling interrupt monitoring uses atomic_xchg() to clear the stored IRQ.\nWhen monitoring is already disabled, atomic_xchg() returns 0. It must not\nbe passed to free_irq().\n\nThe bug is reproducible on an x86_64 QEMU guest with\nCONFIG_GPIO_VIRTUSER=y and CONFIG_GPIO_SIM=y. Configure a live\ngpio-virtuser device through configfs. Its input lookup must refer to a\nlive gpio-sim bank, such as key gpio-sim-test with offset 0. The\nconsumer's dev_name attribute is shown as <dev> below; then run:\n\n    echo 0 > /sys/kernel/debug/gpio-virtuser/<dev>/gpiod:input:0/interrupts\n\nOn an unpatched kernel, this reaches gpio_virtuser_interrupts_set() with\nld->irq still at its initial value 0, and free_irq() reports:\n\n    Trying to free already-free IRQ 0\n\nThe same reproducer completes without the warning on the patched kernel.\n\nFixes: 91581c4b3f29 (\"gpio: virtuser: new virtual testing driver for the GPIO API\")\nAssisted-by: LLM\nSigned-off-by: Runyu Xiao <runyu.xiao@seu.edu.cn>\nReviewed-by: Linus Walleij <linusw@kernel.org>\nLink: https://patch.msgid.link/20260914051537.15320-1-runyu.xiao@seu.edu.cn\nSigned-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>\n```\n\n## Patch diff\n\n### Historical diff\n\n```diff\ndiff --git a/drivers/gpio/gpio-virtuser.c b/drivers/gpio/gpio-virtuser.c\nindex 7d0d366be37a..d5876c19cfef 100644\n--- a/drivers/gpio/gpio-virtuser.c\n+++ b/drivers/gpio/gpio-virtuser.c\n@@ -675,41 +675,42 @@ static int gpio_virtuser_interrupts_set(void *data, u64 val)\n \tif (val > 1)\n \t\treturn -EINVAL;\n \n \tif (val) {\n \t\tirq = gpiod_to_irq(ld->ad.desc);\n \t\tif (irq < 0)\n \t\t\treturn irq;\n \n \t\tret = request_threaded_irq(irq, NULL,\n \t\t\t\t\t   gpio_virtuser_irq_handler,\n \t\t\t\t\t   IRQF_TRIGGER_RISING |\n \t\t\t\t\t   IRQF_TRIGGER_FALLING |\n \t\t\t\t\t   IRQF_ONESHOT,\n \t\t\t\t\t   ld->consumer, data);\n \t\tif (ret)\n \t\t\treturn ret;\n \n \t\tatomic_set(&ld->irq, irq);\n \t} else {\n \t\tirq = atomic_xchg(&ld->irq, 0);\n-\t\tfree_irq(irq, ld);\n+\t\tif (irq)\n+\t\t\tfree_irq(irq, ld);\n \t}\n \n \treturn 0;\n }\n \n DEFINE_DEBUGFS_ATTRIBUTE(gpio_virtuser_interrupts_fops,\n \t\t\t gpio_virtuser_interrupts_get,\n \t\t\t gpio_virtuser_interrupts_set,\n \t\t\t \"%llu\\n\");\n \n static const struct gpio_virtuser_dbgfs_attr_descr\n gpio_virtuser_line_array_dbgfs_attrs[] = {\n \t{\n \t\t.name = \"values\",\n \t\t.fops = &gpio_virtuser_value_array_fops,\n \t},\n \t{\n \t\t.name = \"values_atomic\",\n \t\t.fops = &gpio_virtuser_value_array_atomic_fops,\n \t},\n\n```\n\n## Changed source\n\n### function 'gpio_virtuser_interrupts_set' \u2014 'drivers/gpio/gpio-virtuser.c':670-699 @ 1f1d0812f6a8ab8e6f709c599f137c99646512cc (changed function or its pre-fix counterpart)\n\n```c\nstatic int gpio_virtuser_interrupts_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint irq, ret;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tif (val) {\n\t\tirq = gpiod_to_irq(ld->ad.desc);\n\t\tif (irq < 0)\n\t\t\treturn irq;\n\n\t\tret = request_threaded_irq(irq, NULL,\n\t\t\t\t\t   gpio_virtuser_irq_handler,\n\t\t\t\t\t   IRQF_TRIGGER_RISING |\n\t\t\t\t\t   IRQF_TRIGGER_FALLING |\n\t\t\t\t\t   IRQF_ONESHOT,\n\t\t\t\t\t   ld->consumer, data);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tatomic_set(&ld->irq, irq);\n\t} else {\n\t\tirq = atomic_xchg(&ld->irq, 0);\n\t\tfree_irq(irq, ld);\n\t}\n\n\treturn 0;\n}\n```\n\n### function 'gpio_virtuser_interrupts_set' \u2014 'drivers/gpio/gpio-virtuser.c':670-700 @ 50fd0ada8d37587223001600933270b59cb30e19 (changed function or its post-fix counterpart)\n\n```c\nstatic int gpio_virtuser_interrupts_set(void *data, u64 val)\n{\n\tstruct gpio_virtuser_line_data *ld = data;\n\tint irq, ret;\n\n\tif (val > 1)\n\t\treturn -EINVAL;\n\n\tif (val) {\n\t\tirq = gpiod_to_irq(ld->ad.desc);\n\t\tif (irq < 0)\n\t\t\treturn irq;\n\n\t\tret = request_threaded_irq(irq, NULL,\n\t\t\t\t\t   gpio_virtuser_irq_handler,\n\t\t\t\t\t   IRQF_TRIGGER_RISING |\n\t\t\t\t\t   IRQF_TRIGGER_FALLING |\n\t\t\t\t\t   IRQF_ONESHOT,\n\t\t\t\t\t   ld->consumer, data);\n\t\tif (ret)\n\t\t\treturn ret;\n\n\t\tatomic_set(&ld->irq, irq);\n\t} else {\n\t\tirq = atomic_xchg(&ld->irq, 0);\n\t\tif (irq)\n\t\t\tfree_irq(irq, ld);\n\t}\n\n\treturn 0;\n}\n```\n\n## Local supplementary source\n\n### function 'gpiod_to_irq' \u2014 'include/linux/gpio/consumer.h':519-524 @ 1f1d0812f6a8ab8e6f709c599f137c99646512cc (referenced by changed code: gpiod_to_irq)\n\n```c\nstatic inline int gpiod_to_irq(const struct gpio_desc *desc)\n{\n\t/* GPIO can never have been requested */\n\tWARN_ON(desc);\n\treturn -EINVAL;\n}\n```\n\n### function 'gpiod_to_irq' \u2014 'include/linux/gpio/consumer.h':519-524 @ 50fd0ada8d37587223001600933270b59cb30e19 (referenced by changed code: gpiod_to_irq)\n\n```c\nstatic inline int gpiod_to_irq(const struct gpio_desc *desc)\n{\n\t/* GPIO can never have been requested */\n\tWARN_ON(desc);\n\treturn -EINVAL;\n}\n```\n\n### declaration 'request_threaded_irq' \u2014 'include/linux/interrupt.h':154-157 @ 1f1d0812f6a8ab8e6f709c599f137c99646512cc (referenced by changed code: request_threaded_irq)\n\n```c\nextern int __must_check\nrequest_threaded_irq(unsigned int irq, irq_handler_t handler,\n\t\t     irq_handler_t thread_fn,\n\t\t     unsigned long flags, const char *name, void *dev);\n```\n\n### declaration 'request_threaded_irq' \u2014 'include/linux/interrupt.h':154-157 @ 50fd0ada8d37587223001600933270b59cb30e19 (referenced by changed code: request_threaded_irq)\n\n```c\nextern int __must_check\nrequest_threaded_irq(unsigned int irq, irq_handler_t handler,\n\t\t     irq_handler_t thread_fn,\n\t\t     unsigned long flags, const char *name, void *dev);\n```\n\n### function 'atomic_set' \u2014 'include/linux/atomic/atomic-instrumented.h':64-69 @ 1f1d0812f6a8ab8e6f709c599f137c99646512cc (referenced by changed code: atomic_set)\n\n```c\nstatic __always_inline void\natomic_set(atomic_t *v, int i)\n{\n\tinstrument_atomic_write(v, sizeof(*v));\n\traw_atomic_set(v, i);\n}\n```\n\n### function 'atomic_set' \u2014 'include/linux/atomic/atomic-instrumented.h':64-69 @ 50fd0ada8d37587223001600933270b59cb30e19 (referenced by changed code: atomic_set)\n\n```c\nstatic __always_inline void\natomic_set(atomic_t *v, int i)\n{\n\tinstrument_atomic_write(v, sizeof(*v));\n\traw_atomic_set(v, i);\n}\n```\n\n### function 'instrument_atomic_write' \u2014 'include/linux/instrumented.h':95-100 @ 1f1d0812f6a8ab8e6f709c599f137c99646512cc (one-level callee of atomic_set)\n\n```c\nstatic __always_inline void instrument_atomic_write(const volatile void *v, size_t size)\n{\n\tkasan_check_write(v, size);\n\tkcsan_check_atomic_write(v, size);\n\tinstrument_atomic_check_alignment(v, size);\n}\n```\n\n### function 'raw_atomic_set' \u2014 'include/linux/atomic/atomic-arch-fallback.h':500-504 @ 1f1d0812f6a8ab8e6f709c599f137c99646512cc (one-level callee of atomic_set)\n\n```c\nstatic __always_inline void\nraw_atomic_set(atomic_t *v, int i)\n{\n\tarch_atomic_set(v, i);\n}\n```\n\n### function 'instrument_atomic_write' \u2014 'include/linux/instrumented.h':95-100 @ 50fd0ada8d37587223001600933270b59cb30e19 (one-level callee of atomic_set)\n\n```c\nstatic __always_inline void instrument_atomic_write(const volatile void *v, size_t size)\n{\n\tkasan_check_write(v, size);\n\tkcsan_check_atomic_write(v, size);\n\tinstrument_atomic_check_alignment(v, size);\n}\n```\n\n### function 'raw_atomic_set' \u2014 'include/linux/atomic/atomic-arch-fallback.h':500-504 @ 50fd0ada8d37587223001600933270b59cb30e19 (one-level callee of atomic_set)\n\n```c\nstatic __always_inline void\nraw_atomic_set(atomic_t *v, int i)\n{\n\tarch_atomic_set(v, i);\n}\n```\n\n### function 'atomic_xchg' \u2014 'include/linux/atomic/atomic-instrumented.h':1115-1121 @ 1f1d0812f6a8ab8e6f709c599f137c99646512cc (referenced by changed code: atomic_xchg)\n\n```c\nstatic __always_inline int\natomic_xchg(atomic_t *v, int new)\n{\n\tkcsan_mb();\n\tinstrument_atomic_read_write(v, sizeof(*v));\n\treturn raw_atomic_xchg(v, new);\n}\n```\n\n### function 'atomic_xchg' \u2014 'include/linux/atomic/atomic-instrumented.h':1115-1121 @ 50fd0ada8d37587223001600933270b59cb30e19 (referenced by changed code: atomic_xchg)\n\n```c\nstatic __always_inline int\natomic_xchg(atomic_t *v, int new)\n{\n\tkcsan_mb();\n\tinstrument_atomic_read_write(v, sizeof(*v));\n\treturn raw_atomic_xchg(v, new);\n}\n```\n\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/atomic.h'\n- include_unresolved: 'Cannot resolve asm/barrier.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/device.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/errno.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/ptrace.h'\n- include_unresolved: 'Cannot resolve asm/irq.h'\n- include_unresolved: 'Cannot resolve asm/sections.h'\n- include_unresolved: 'Cannot resolve asm/irq_work.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/barrier.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/percpu.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/module.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/current.h'\n- include_unresolved: 'Cannot resolve asm/processor.h'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- parse_error: 'C parse errors; extracted spans are best effort'\n- include_unresolved: 'Cannot resolve asm/byteorder.h'\n- include_unresolved: 'Cannot resolve asm/prom.h'\n\n## Collection notes\n\n269 diagnostic(s). Full provenance, raw collected material, and diagnostics are in context.json.\n",
+  "schema_version": 1,
+  "include_supplements": true,
+  "complete": false
+}
